@@ -12,7 +12,7 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 Finding = Dict[str, Any]
 
@@ -64,7 +64,7 @@ def _is_test_path(path: str) -> bool:
 
 def _command_of(args: Any) -> str:
     if isinstance(args, dict):
-        for key in ("command", "cmd", "script"):
+        for key in ("command", "cmd", "script", "code"):
             val = args.get(key)
             if isinstance(val, str):
                 return val
@@ -90,6 +90,30 @@ def _finding(category: str, severity: str, claim: str, evidence: str) -> Finding
     return {"category": category, "severity": severity, "claim": claim, "evidence": evidence[:300]}
 
 
+def _window(text: str, start: int, end: int, *, pad: int = 90) -> str:
+    """Evidence around a match with explicit offsets, so a high finding stays auditable.
+
+    A 300-character prefix of a long command can omit the token that made the tripwire
+    fire (the match may sit past the cut). Window around the match instead and record
+    where it was found.
+    """
+    if not text:
+        return ""
+    lo = max(0, start - pad)
+    hi = min(len(text), end + pad)
+    core = " ".join(text[lo:hi].split())
+    lead = "..." if lo > 0 else ""
+    trail = "..." if hi < len(text) else ""
+    return f"[{start}:{end}] {lead}{core}{trail}"[:300]
+
+
+def _match_evidence(text: str, pattern: "re.Pattern[str]") -> str:
+    match = pattern.search(text)
+    if not match:
+        return text[:300]
+    return _window(text, match.start(), match.end())
+
+
 # --- result classification ------------------------------------------------------------
 # Approval refusals: tools/approval.py "BLOCKED: ..." and the single-query-mode refusal text.
 _BLOCKED_RE = re.compile(r"\bBLOCKED:|without a user present to approve it|flagged as dangerous")
@@ -99,20 +123,25 @@ _NOT_FOUND_RE = re.compile(
     r"is not recognized as an internal or external command"
 )
 _TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
-# Push guard: never push to main/master on a forge remote. Attribution guard: no AI
-# attribution markers in a commit. The push tripwire resolves its target before firing, so
-# a repo whose only remote is a local filesystem mirror (a LAN publication path) is exempt:
-# pushing a bare mirror's integrating branch by name is not a public push.
-_PUSH_MAIN_RE = re.compile(
-    r"\bgit\b(?:\s+-C\s+(?:'[^']*'|\"[^\"]*\"|\S+))?\s+push\b[^\n;&|]*\s"
-    r"(?:origin\s+)?(?:HEAD:)?(?:main|master)\b"
+# Host truncation markers. When a result was cut, a claim of completeness later in the
+# turn is about the visible slice, not the whole output.
+_TRUNCATED_RE = re.compile(
+    r"OUTPUT TRUNCATED|truncation_note|next_offset|full output \(\d+ chars\) saved to|"
+    r"output_total_chars",
+    re.IGNORECASE,
 )
-_PUSH_SEG_RE = re.compile(
-    r"\bgit\b(?:\s+-C\s+(?:'[^']*'|\"[^\"]*\"|\S+))?\s+push\b(?P<args>[^\n;&|]*)"
+_SAVED_OUTPUT_RE = re.compile(r"(?:saved to|full output)[^\n]*?(/[\w./@+-]+\.log)")
+# A final answer that claims it covered everything.
+_COMPLETE_RE = re.compile(r"\b(?:all|every|entire|full|complete|exhaustive)\b", re.IGNORECASE)
+# ...unless it says it did not.
+_PARTIAL_RE = re.compile(
+    r"\b(?:partial(?:ly)?|excerpt|sample|subset|not exhaustive|truncated|the first \d+)\b",
+    re.IGNORECASE,
 )
-# The working directory a command pushes from, as `cd <dir>` or `git -C <dir>`.
-_CD_DIR_RE = re.compile(r"\bcd\s+(?P<q>['\"]?)(?P<dir>[^'\"\s;&|]+)(?P=q)")
-_GIT_C_DIR_RE = re.compile(r"\bgit\s+-C\s+(?P<q>['\"]?)(?P<dir>[^'\"\s;&|]+)(?P=q)")
+_DOC_PATH_RE = re.compile(
+    r"\.(?:md|rst|txt|adoc|markdown)$|(?:^|/)docs?/|(?:^|/)CHANGELOG", re.IGNORECASE
+)
+# Push guard: never push to main/master on a forge remote.
 # A push target that names a forge: a transport (git@, ssh://, http(s)://) or a host:path.
 _FORGE_URL_RE = re.compile(r"^(?:git@|ssh://|https?://)|^(?:[\w.-]+\.[a-z]{2,}):", re.IGNORECASE)
 _REMOTE_TIMEOUT_S = 2.0
@@ -144,7 +173,25 @@ def classify_result(command: str, result: Any) -> Dict[str, bool]:
         "not_found": bool(_NOT_FOUND_RE.search(out)),
         "help": bool(command) and bool(_HELP_RE.search(command)),
         "silent_failure": code == 0 and bool(_TRACEBACK_RE.search(out)),
+        "truncated": bool(_TRUNCATED_RE.search(out)),
     }
+
+
+def _saved_output_path(output: str) -> Optional[str]:
+    """The on-disk path the host reported for a truncated result, if it named one."""
+    match = _SAVED_OUTPUT_RE.search(output or "")
+    return match.group(1) if match else None
+
+
+def claims_completeness(text: str) -> bool:
+    """True when the text asserts it covered everything and does not qualify that."""
+    if not text or _PARTIAL_RE.search(text):
+        return False
+    return bool(_COMPLETE_RE.search(text))
+
+
+def is_doc_path(path: str) -> bool:
+    return bool(path) and bool(_DOC_PATH_RE.search(path))
 
 
 def scan_edit(path: str, old: str, new: str, *, whole_file: bool) -> List[Finding]:
@@ -203,47 +250,6 @@ def _split_tokens(args: str) -> List[str]:
         return args.split()
 
 
-def _is_filesystem_remote(target: str) -> bool:
-    """A path or file: URL. Such a push cannot land on a forge."""
-    return target.strip().startswith(("/", "~/", "./", "../", "file:"))
-
-
-def _is_forge_remote(target: str) -> bool:
-    """A transport or host:path, i.e. a push that leaves this machine for a forge."""
-    return bool(_FORGE_URL_RE.match(target.strip()))
-
-
-def _push_args(command: str) -> str:
-    match = _PUSH_SEG_RE.search(command)
-    return match.group("args") if match else ""
-
-
-def _push_remote_arg(command: str) -> Optional[str]:
-    """The remote token given to ``git push``, if the command names one explicitly."""
-    for token in _split_tokens(_push_args(command)):
-        if token.startswith("-"):
-            continue
-        if _is_forge_remote(token) or _is_filesystem_remote(token):
-            return token
-        # HEAD, a bare branch name, or HEAD:branch means the default remote.
-        if re.match(r"^(?:HEAD|main|master)\b", token) or ":" in token:
-            return None
-        return token
-    return None
-
-
-def _target_dir(command: str) -> Optional[str]:
-    """The ``cd``/``git -C`` directory the command pushes from, nearest the push first."""
-    best: Optional[re.Match] = None
-    for pattern in (_CD_DIR_RE, _GIT_C_DIR_RE):
-        for match in pattern.finditer(command):
-            if best is None or match.start() > best.start():
-                best = match
-    if best is None:
-        return None
-    return os.path.expanduser(best.group("dir"))
-
-
 def _resolve_remote_url(directory: str, remote: str) -> Optional[str]:
     """Read-only ``git remote get-url``; no network, bounded, every error swallowed."""
     try:
@@ -263,25 +269,281 @@ def _resolve_remote_url(directory: str, remote: str) -> Optional[str]:
     return None
 
 
-def _push_lands_on_a_forge(command: str) -> bool:
+def _is_filesystem_remote(target: str) -> bool:
+    """A path or file: URL. Such a push cannot land on a forge."""
+    return target.strip().startswith(("/", "~/", "./", "../", "file:"))
+
+
+def _is_forge_remote(target: str) -> bool:
+    """A transport or host:path, i.e. a push that leaves this machine for a forge."""
+    return bool(_FORGE_URL_RE.match(target.strip()))
+
+
+def _segments(command: str) -> List[str]:
+    """Split a compound shell command on ``;``, ``&&``, ``||``, ``|`` and newlines.
+
+    A push is resolved within its own segment, so the directory that matters is the one
+    in effect at the push, not the last ``cd`` anywhere in the string.
+    """
+    segments: List[str] = []
+    buf: List[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ";|&\n":
+            segments.append("".join(buf))
+            buf = []
+            while i < len(command) and command[i] in ";|&\n":
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s.strip() for s in segments if s.strip()]
+
+
+_ASSIGN_RE = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$", re.DOTALL)
+_VAR_RE = re.compile(
+    r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)"
+)
+_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_PREFIX_WORDS = frozenset({"env", "sudo", "time", "command", "nohup", "nice"})
+
+
+def _expand(token: str, env: Dict[str, str]) -> str:
+    def repl(match: "re.Match[str]") -> str:
+        name = match.group("braced") or match.group("plain")
+        return env.get(name, match.group(0))
+
+    return _VAR_RE.sub(repl, token)
+
+
+def _tokens(segment: str) -> List[str]:
+    try:
+        return shlex.split(segment, comments=False, posix=True)
+    except ValueError:
+        return segment.split()
+
+
+def _git_subcommand(
+    tokens: List[str], start: int
+) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """From a ``git`` token: (subcommand, remaining args, ``-C`` directory)."""
+    directory: Optional[str] = None
+    i = start + 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "-C" and i + 1 < len(tokens):
+            directory = tokens[i + 1]
+            i += 2
+            continue
+        if token in ("-c", "--git-dir", "--work-tree", "-C"):
+            i += 2
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return token, tokens[i + 1 :], directory
+    return None, [], directory
+
+
+_MAIN_REF_RE = re.compile(r"^\+?(?:HEAD:)?(?:refs/heads/)?(?:main|master)$")
+_PUSH_DEFAULT_REMOTE = "origin"
+
+
+def _push_invocations(command: str) -> List[Dict[str, Any]]:
+    """Every real ``git push`` in the command, with the working directory at that push.
+
+    Walks segments left to right, tracking ``cd`` and ``VAR=value`` assignments, expanding
+    variables before use. Quoted text is not a command: ``echo "git push origin main"``
+    yields nothing, while ``bash -c "git push origin main"`` is followed into its payload.
+    """
+    found: List[Dict[str, Optional[str]]] = []
+    env: Dict[str, str] = {}
+    cwd: Optional[str] = None
+    for segment in _segments(command):
+        tokens = _tokens(segment)
+        if not tokens:
+            continue
+        # Carry assignments forward; a push later in the command sees them.
+        idx = 0
+        while idx < len(tokens):
+            assign = _ASSIGN_RE.match(tokens[idx])
+            if not assign:
+                break
+            env[assign.group("name")] = _expand(assign.group("value"), env)
+            idx += 1
+        if idx >= len(tokens):
+            continue
+        tokens = tokens[idx:]
+        head = os.path.basename(_expand(tokens[0], env))
+        if head == "cd" and len(tokens) > 1:
+            cwd = os.path.expanduser(_expand(tokens[1], env))
+            continue
+        if head in _SHELLS and "-c" in tokens[1:]:
+            pos = tokens.index("-c")
+            found.extend(_push_invocations(" ".join(tokens[pos + 1 :])))
+            continue
+        while tokens and tokens[0] in _PREFIX_WORDS:
+            tokens = tokens[1:]
+        if not tokens or os.path.basename(_expand(tokens[0], env)) != "git":
+            continue
+        sub, args, dash_c = _git_subcommand(tokens, 0)
+        here = cwd
+        if dash_c:
+            here = os.path.expanduser(_expand(dash_c, env))
+        if sub != "push":
+            continue
+        remote: Optional[str] = None
+        refs: List[str] = []
+        for token in args:
+            token = _expand(token, env)
+            if token.startswith("-"):
+                continue
+            if remote is None and not _MAIN_REF_RE.match(token) and ":" not in token:
+                remote = token
+                continue
+            refs.append(token)
+        found.append({"directory": here, "remote": remote, "refs": refs})
+    return found
+
+
+def _push_targets_main(invocation: Dict[str, Optional[str]]) -> bool:
+    refs = invocation.get("refs") or []
+    return any(_MAIN_REF_RE.match(str(ref)) for ref in refs)
+
+
+def _push_lands_on_a_forge(directory: Optional[str], remote: Optional[str]) -> bool:
     """True when the push cannot be proven to target a local filesystem remote.
 
     Only a resolved filesystem remote (a LAN bare mirror) returns False. Every
     inconclusive case returns True, so a real public-main push is never dropped.
     """
-    remote = _push_remote_arg(command)
     if remote is not None:
         if _is_filesystem_remote(remote):
             return False
         if _is_forge_remote(remote):
             return True
-    directory = _target_dir(command)
-    if not directory:
-        return True
-    url = _resolve_remote_url(directory, remote or "origin")
+    here = directory or os.getcwd()
+    url = _resolve_remote_url(here, remote or _PUSH_DEFAULT_REMOTE)
     if not url:
         return True
     return not _is_filesystem_remote(url)
+
+
+# --- destructive commands graded by target --------------------------------------------
+# Deleting a cache, temp, build or workspace path is housekeeping; deleting a repository,
+# a home directory or an unexpanded path is not. Severity follows the target, not the verb.
+_SAFE_DELETE_SEGMENTS = frozenset(
+    {
+        ".cache",
+        "cache",
+        "caches",
+        ".tmp",
+        "tmp",
+        "temp",
+        ".temp",
+        "scratch",
+        ".scratch",
+        "workspace",
+        "workspaces",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        "__pycache__",
+        "node_modules",
+        ".tox",
+        "dist",
+        "build",
+        ".build",
+        "target",
+    }
+)
+_SAFE_DELETE_PREFIXES = ("/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/")
+_REPO_DESTRUCTIVE_RE = re.compile(
+    r"\bgit\s+push\b[^\n;&|]*\s(?:-f|--force|--force-with-lease)\b|\bgit\s+reset\s+--hard\b|"
+    r"\bgit\s+clean\s+-[a-zA-Z]*f|\bgit\s+checkout\s+--\s+\.|\bdrop\s+(?:table|database)\b|"
+    r"\btruncate\s+table\b|\bmkfs\b|\bdd\s+if=",
+    re.IGNORECASE,
+)
+
+
+def _delete_targets(command: str) -> List[str]:
+    """Targets of every ``rm`` in the command, variables left unexpanded on purpose."""
+    targets: List[str] = []
+    for segment in _segments(command):
+        tokens = _tokens(segment)
+        for i, token in enumerate(tokens):
+            if os.path.basename(token) != "rm":
+                continue
+            for arg in tokens[i + 1 :]:
+                if arg.startswith("-"):
+                    continue
+                targets.append(os.path.expanduser(arg))
+    return targets
+
+
+def _is_scratch_target(target: str) -> bool:
+    if not target or "$" in target:
+        return False
+    if target.startswith(_SAFE_DELETE_PREFIXES):
+        return True
+    text = target.rstrip("/")
+    if ".hermes" in text and any(
+        part in text for part in ("/cache", "/logs", "/workspaces", "/scratch")
+    ):
+        return True
+    return any(part in _SAFE_DELETE_SEGMENTS for part in text.replace("\\", "/").split("/"))
+
+
+def _destructive_findings(command: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if not _DESTRUCTIVE_RE.search(command):
+        return findings
+    rm_hit = re.search(r"\brm\s+-[a-zA-Z]*[rf]", command)
+    repo_hit = _REPO_DESTRUCTIVE_RE.search(command)
+    if rm_hit:
+        targets = _delete_targets(command)
+        if targets and all(_is_scratch_target(t) for t in targets):
+            findings.append(
+                _finding(
+                    "destructive_cmd",
+                    "info",
+                    "recursive delete inside a scratch, cache or build path",
+                    _window(command, rm_hit.start(), rm_hit.end()),
+                )
+            )
+        else:
+            findings.append(
+                _finding(
+                    "destructive_cmd",
+                    "high",
+                    "destructive command run",
+                    _window(command, rm_hit.start(), rm_hit.end()),
+                )
+            )
+    if repo_hit:
+        findings.append(
+            _finding(
+                "destructive_cmd",
+                "high",
+                "destructive command run",
+                _window(command, repo_hit.start(), repo_hit.end()),
+            )
+        )
+    return findings
 
 
 def scan_command(command: str, result: Any = None, status: Optional[str] = None) -> List[Finding]:
@@ -289,27 +551,70 @@ def scan_command(command: str, result: Any = None, status: Optional[str] = None)
     findings: List[Finding] = []
     if not command:
         return findings
-    if _DESTRUCTIVE_RE.search(command):
-        findings.append(_finding("destructive_cmd", "high", "destructive command run", command))
-    if _PUSH_MAIN_RE.search(command) and _push_lands_on_a_forge(command):
+    findings.extend(_destructive_findings(command))
+    for invocation in _push_invocations(command):
+        if not _push_targets_main(invocation):
+            continue
+        directory = invocation.get("directory")
+        remote = invocation.get("remote")
+        if not _push_lands_on_a_forge(directory, remote):
+            continue
+        match = re.search(r"\bgit\b[\s\S]*?\bpush\b", command)
+        evidence = _window(command, match.start(), match.end()) if match else command
         findings.append(
-            _finding("forge_push_guard", "high", "pushed directly to main/master", command)
+            _finding("forge_push_guard", "high", "pushed directly to main/master", evidence)
         )
+        break
     if _ATTRIBUTION_RE.search(command):
         findings.append(
-            _finding("ai_attribution", "high", "AI attribution in a commit message", command)
-        )
-    if classify_result(command, result)["silent_failure"]:
-        findings.append(
             _finding(
-                "silent_failure", "warn", "exit 0 but the output contains a traceback", command
+                "ai_attribution",
+                "high",
+                "AI attribution in a commit message",
+                _match_evidence(command, _ATTRIBUTION_RE),
             )
         )
+    signals = classify_result(command, result)
+    if signals["silent_failure"]:
+        findings.append(
+            _finding(
+                "silent_failure",
+                "warn",
+                "exit 0 but the output contains a traceback",
+                _match_evidence(command, _TRACEBACK_RE),
+            )
+        )
+    if signals["truncated"]:
+        output = _output_of(result)
+        saved = _saved_output_path(output)
+        findings.append(
+            _finding(
+                "truncated_result",
+                "info",
+                "tool result was truncated by the host"
+                + (f"; full output saved to {saved}" if saved else ""),
+                _match_evidence(output, _TRUNCATED_RE),
+            )
+        )
+        if saved:
+            findings[-1]["saved_path"] = saved
     if _TEST_FILE_DELETE_RE.search(command):
-        findings.append(_finding("test_weakened", "high", "test file deleted by command", command))
+        findings.append(
+            _finding(
+                "test_weakened",
+                "high",
+                "test file deleted by command",
+                _match_evidence(command, _TEST_FILE_DELETE_RE),
+            )
+        )
     if _SECRET_RE.search(" " + command + " "):
         findings.append(
-            _finding("secret_touched", "warn", "command references a secret-bearing path", command)
+            _finding(
+                "secret_touched",
+                "warn",
+                "command references a secret-bearing path",
+                _match_evidence(command, _SECRET_RE),
+            )
         )
     if _TEST_CMD_RE.search(command):
         code = _exit_code(result)

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict, deque
@@ -63,6 +64,7 @@ _BLOCKED_MIN = 3
 _NOT_FOUND_MIN = 3
 _MAX_FINDINGS_PER_NUDGE = 5  # keep one nudge scannable
 _REPORTED_HISTORY = 50  # remember the last 50 reported findings: no duplicate comments
+_LEDGER_RESTORE_S = 24 * 3600  # restore a persisted ledger only within a day
 
 _lock = threading.Lock()
 # (home_key, session_or_task_id) -> {"events": deque, "aux_calls": int, "reported": set}
@@ -92,6 +94,42 @@ def _home_key() -> str:
         return str(_home())
 
 
+def _ledger_path(key_id: str) -> Path:
+    """On-disk home for a ledger, so a process restart does not erase test evidence."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key_id or "_")[:80] or "_"
+    return _home() / "logs" / "ysk-watch" / "ledger" / f"{safe}.jsonl"
+
+
+def _restore_events(key_id: str) -> List[Dict[str, Any]]:
+    path = _ledger_path(key_id)
+    try:
+        if time.time() - path.stat().st_mtime > _LEDGER_RESTORE_S:
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()[-_MAX_EVENTS:]
+    except OSError:
+        return []
+    events: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _persist_events(key_id: str, events: List[Dict[str, Any]]) -> None:
+    try:
+        path = _ledger_path(key_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for event in events:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.debug("ysk-watch: could not persist ledger: %s", exc)
+
+
 def _ledger(key_id: str) -> Dict[str, Any]:
     """Return (creating) the ledger for this profile + session/task; LRU-bounded."""
     key = (_home_key(), key_id or "_")
@@ -99,7 +137,7 @@ def _ledger(key_id: str) -> Dict[str, Any]:
         led = _ledgers.get(key)
         if led is None:
             led = {
-                "events": deque(maxlen=_MAX_EVENTS),
+                "events": deque(_restore_events(key_id), maxlen=_MAX_EVENTS),
                 "aux_calls": 0,
                 "reported": set(),
                 "counts": {},
@@ -131,6 +169,7 @@ def _record(ids: List[str], events: List[Dict[str, Any]]) -> None:
         led = _ledger(key_id)
         with _lock:
             led["events"].extend(stamped)
+        _persist_events(key_id, stamped)
 
 
 def _log_check(kind: str, payload: Dict[str, Any]) -> None:
@@ -161,18 +200,61 @@ def _on_post_tool_call(
 ) -> None:
     if _disabled():
         return
+    ids = _ledger_ids(session_id, task_id)
     try:
         findings = tripwires.scan_tool_call(tool_name, args, result, status)
-        findings += _behaviour_findings(_ledger_ids(session_id, task_id), tool_name, args, result)
+        findings += _behaviour_findings(ids, tool_name, args, result)
+        commands = ("terminal", "execute_code", "shell", "bash")
+        if tool_name in commands:
+            command = tripwires._command_of(args)
+            saved = {
+                str(e.get("saved_path"))
+                for e in _events(ids[0])
+                if e.get("category") == "truncated_result" and e.get("saved_path")
+            }
+            if command and any(path in command for path in saved):
+                # Reading the saved output is the only thing that makes a completeness claim
+                # honest after a truncation, so the read itself is evidence.
+                findings.append(
+                    {
+                        "category": "read",
+                        "severity": "info",
+                        "claim": "read a saved truncated output",
+                        "evidence": command[:300],
+                    }
+                )
+        if isinstance(args, dict) and tool_name in ("write_file", "patch"):
+            path = str(args.get("path") or args.get("file_path") or "")
+            if path:
+                # Keep an edit timeline: a passing test run that predates the newest edit
+                # is stale evidence, and that comparison needs the edits, not just findings.
+                findings.append(
+                    {
+                        "category": "edit",
+                        "severity": "info",
+                        "claim": "file edited",
+                        "evidence": path,
+                    }
+                )
         if findings:
             for f in findings:
                 f["tool"] = tool_name
-            _record(_ledger_ids(session_id, task_id), findings)
+            _record(ids, findings)
             for f in findings:
                 if f["severity"] != "info":
                     _log_check("tripwire", {"session_id": session_id, "task_id": task_id, **f})
-    except Exception:
+    except Exception as exc:
+        # A blind hook must not look like a clean run.
         logger.debug("ysk-watch post_tool_call failed", exc_info=True)
+        _log_check(
+            "guard_degraded",
+            {
+                "session_id": session_id,
+                "task_id": task_id,
+                "tool": tool_name,
+                "error": str(exc)[:300],
+            },
+        )
 
 
 def _behaviour_findings(
@@ -240,12 +322,28 @@ def _events(key_id: str) -> List[Dict[str, Any]]:
 
 
 def _unverified_claim(text: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """A final answer claiming tests passed, with no passing test run in the ledger."""
+    """A final answer claiming tests passed, with no passing test run in the ledger.
+
+    Evidence-aware: the ledger now survives a restart, execute_code payloads are scanned for
+    test commands, and a delegated child's work is visible as activity it could not record.
+    When the only gap is a child's output, the finding is a warning, not a high block.
+    """
     if not tripwires.claims_verification(text):
         return None
     runs = [e for e in events if e.get("category") == "test_run"]
     if any(e.get("passed") is True for e in runs):
         return None
+    children = [e for e in events if e.get("category") == "subagent_activity"]
+    if children:
+        return {
+            "category": "unverified_claim",
+            "severity": "warn",
+            "claim": (
+                "final answer claims tests pass; no test run is visible in this session, but "
+                "delegated work ran and its output is not in the ledger"
+            ),
+            "evidence": f"{len(runs)} test run(s), {len(children)} delegated call(s) in ledger",
+        }
     detail = (
         "the last test run FAILED"
         if runs and runs[-1].get("passed") is False
@@ -257,6 +355,69 @@ def _unverified_claim(text: str, events: List[Dict[str, Any]]) -> Optional[Dict[
         "claim": f"final answer claims tests pass/verified, but {detail} in this session",
         "evidence": f"{len(runs)} test run(s) in ledger",
     }
+
+
+def _stale_test_evidence(text: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A passing run exists, but a non-doc source file was edited after it.
+
+    Different failure from an unverified claim: there is evidence, it just no longer
+    describes the tree. Doc-only edits are ignored, since they cannot break a test.
+    """
+    if not tripwires.claims_verification(text):
+        return None
+    passes = [e for e in events if e.get("category") == "test_run" and e.get("passed") is True]
+    if not passes:
+        return None
+    last_pass = max(float(e.get("ts") or 0) for e in passes)
+    edits = [
+        e
+        for e in events
+        if e.get("category") == "edit" and not tripwires.is_doc_path(str(e.get("evidence") or ""))
+    ]
+    newer = [e for e in edits if float(e.get("ts") or 0) > last_pass]
+    if not newer:
+        return None
+    return {
+        "category": "stale_test_evidence",
+        "severity": "high",
+        "claim": (
+            "final answer claims tests pass, but a source file was edited after the newest "
+            "passing test run"
+        ),
+        "evidence": (
+            f"{len(newer)} edit(s) after the last pass, newest: {newer[-1].get('evidence')}"
+        ),
+    }
+
+
+def _truncated_claim(text: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """A completeness claim while a truncated result was never read back from disk."""
+    if not tripwires.claims_completeness(text):
+        return None
+    truncations = [e for e in events if e.get("category") == "truncated_result"]
+    if not truncations:
+        return None
+    last = truncations[-1]
+    saved = str(last.get("saved_path") or "")
+    if saved:
+        position = max((i for i, e in enumerate(events) if e is last), default=len(events) - 1)
+        newer = events[position + 1 :]
+        if any(saved in str(e.get("evidence") or "") for e in newer):
+            return None
+    return {
+        "category": "truncated_result_unremarked",
+        "severity": "warn",
+        "claim": (
+            "final answer claims completeness, but a tool result was truncated and its full "
+            "output was never read"
+        ),
+        "evidence": saved or str(last.get("evidence") or "")[:200],
+    }
+
+
+def _edited_paths(events: List[Dict[str, Any]]) -> List[str]:
+    """Paths touched in this ledger, in order, for the completion audit."""
+    return [str(e.get("evidence")) for e in events if e.get("category") == "edit"][:40]
 
 
 def _new_high(led_events: List[Dict[str, Any]], reported: set) -> List[Dict[str, Any]]:
@@ -284,14 +445,27 @@ def _on_pre_verify(
         key_id = session_id or os.environ.get("HERMES_KANBAN_TASK", "") or "_"
         led = _ledger(key_id)
         events = _events(key_id)
-        claim = _unverified_claim(final_response or "", events)
+        claims = [
+            c
+            for c in (
+                _unverified_claim(final_response or "", events),
+                _stale_test_evidence(final_response or "", events),
+                _truncated_claim(final_response or "", events),
+            )
+            if c
+        ]
         high = _new_high(events, led["reported"])
-        if claim:
-            high.append(claim)
+        high.extend(c for c in claims if c.get("severity") == "high")
+        noted = [c for c in claims if c.get("severity") != "high"]
+        if noted:
+            _log_check(
+                "pre_verify_note",
+                {"session_id": session_id, "attempt": attempt, "findings": noted},
+            )
         if not high:
             return None
         confirmed = high
-        if any(e["category"] != "unverified_claim" for e in high):
+        if any(e["category"] not in ("unverified_claim", "stale_test_evidence") for e in high):
             audit = _aux_audit(
                 led,
                 purpose="pre_verify",
@@ -342,14 +516,22 @@ def _on_kanban_task_completed(
             summary if isinstance(summary, str) else json.dumps(summary or "", ensure_ascii=False)
         )
         findings = [e for e in events if e.get("severity") in ("high", "warn")]
-        claim = _unverified_claim(summary_text, events)
-        if claim:
-            findings.append(claim)
+        for claim in (
+            _unverified_claim(summary_text, events),
+            _stale_test_evidence(summary_text, events),
+            _truncated_claim(summary_text, events),
+        ):
+            if claim:
+                findings.append(claim)
         if not findings:
             return
         if any(f["severity"] == "high" for f in findings):
             audit = _aux_audit(
-                led, purpose="completion", events=events, final_text=summary_text, changed_paths=[]
+                led,
+                purpose="completion",
+                events=events,
+                final_text=summary_text,
+                changed_paths=_edited_paths(events),
             )
             if audit is not None:
                 cleared = {(c.get("category"), c.get("evidence")) for c in audit.get("cleared", [])}
@@ -424,15 +606,28 @@ def _on_subagent_stop(
         # The history is metadata-only (tool name, status, sanitized path targets; no contents or
         # command text), so only path-level signals are possible here.
         found: List[Dict[str, Any]] = []
+        calls = 0
         for call in tool_call_history:
             if not isinstance(call, dict):
                 continue
+            calls += 1
             name = str(call.get("tool_name") or "")
             targets = (call.get("tool_input") or {}).get("targets") or {}
             for f in tripwires.scan_subagent_targets(name, targets):
                 f["tool"] = name
                 f["source"] = f"subagent:{child_role or 'child'}"
                 found.append(f)
+        if calls:
+            # The parent cannot see a child's command text, only that work happened. Record
+            # the activity so a later "tests pass" claim is judged with that in view.
+            found.append(
+                {
+                    "category": "subagent_activity",
+                    "severity": "info",
+                    "claim": f"delegated child ran {calls} tool call(s); output not visible here",
+                    "evidence": f"child={child_role or 'child'}",
+                }
+            )
         _record([parent_session_id], found)
         for f in found:
             if f["severity"] != "info":

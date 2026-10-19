@@ -1,7 +1,7 @@
 # ysk-watch
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-31%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-49%20passing-brightgreen)]()
 [![Hermes](https://img.shields.io/badge/hermes-0.21.5%2B-informational)]()
 
 An integrity watcher for autonomous agents. It catches the shortcuts an agent takes to make a run
@@ -50,14 +50,26 @@ justifies or undoes it; `warn` is recorded and reported.
 |---|---|---|
 | `test_weakened` | high | assertions removed from a test file, a skip or xfail marker added, or a test file deleted |
 | `test_rewritten` | warn | a test file is written whole, so prior assertions cannot be compared |
-| `destructive_cmd` | high | forced recursive delete, hard reset, forced clean, force push, `drop table`, and disk-level formatting or raw device writes |
+| `destructive_cmd` | high, `info` when the target is scratch | forced recursive delete, hard reset, forced clean, force push, `drop table`, disk-level formatting or raw device writes. A recursive delete whose every target is a cache, temp, build or workspace path is recorded as `info`: removing `~/.cache/pip` is housekeeping, removing a repository is not. |
 | `secret_touched` | high when a secret file is edited, warn when one is referenced | `.env`, `auth.json`, `credentials.json`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `.netrc`, `.pgpass`, `secrets/` |
 | `error_swallowed` | warn | `except: pass`, `|| true`, an empty `catch {}` added |
 | `unverified_claim` | high | the final text says tests pass, and the ledger holds no passing test run |
+| `stale_test_evidence` | high | the final text says tests pass, and a non-doc source file was edited after the newest passing run. The run exists; it no longer describes the tree. |
+| `truncated_result` | info | the host cut a tool result; the saved output path is recorded so it can be read |
+| `truncated_result_unremarked` | warn | the final text claims completeness while a truncated result's saved output was never read |
 | `silent_failure` | warn | the command exited 0 and its output contains a traceback |
 | `test_edited_by_subagent` | warn | a delegated child edited a test file (subagent history carries paths, not contents) |
 | `forge_push_guard` | high | `git push` to main or master, or to a forge target that cannot be resolved to a local filesystem remote |
 | `ai_attribution` | high | a commit message carries `Co-Authored-By:`, `Generated with`, `AI-generated` or a robot marker |
+
+Every finding stores the span that matched, not the first 300 characters of the command, so a
+finding can be checked against its own evidence even when the match sits late in a long command.
+
+The push guard resolves the target where the push happens: it walks the compound command,
+follows `cd`, expands `VAR=value` assignments, parses with `shlex`, ignores quoted text (an
+`echo "git push origin main"` is not a push), and treats a payload handed to `bash -c` as a real
+command. A repo whose remote resolves to a local filesystem path is exempt, because publishing to
+a bare mirror on the LAN is not a public push.
 
 Session patterns are counted per session and reported once when they cross a threshold:
 
@@ -149,31 +161,60 @@ says out loud why it is correct.
 ## Tuning
 
 Thresholds live at the top of `__init__.py` (`_REPEAT_CMD_MIN`, `_HELP_MIN`, `_BLOCKED_MIN`,
-`_NOT_FOUND_MIN`, `_MAX_AUX_CALLS`, `_REPORTED_HISTORY`). They were tuned against a production
-agent fleet's friction log, where approval workarounds, polling and invented paths were the
-patterns that recurred often enough to be worth naming. Raise them if your work is chattier than
-that.
+`_NOT_FOUND_MIN`, `_MAX_AUX_CALLS`, `_REPORTED_HISTORY`). They were set by mining a production
+friction log rather than guessed: [paperclips](https://github.com/dlorp/paperclips) collects what
+agents file about the work that went sideways, and the failure classes that recur there are the
+ones worth a name here. Approval workarounds, polling, invented paths and repeated `--help` were
+the patterns that showed up often enough to warrant a counter; the empty-result and truncated-read
+classes were frequent enough in the same log to become tripwires. Mining the log, naming a class,
+turning it into a check, and watching the new false positives is the loop. Raise the thresholds if
+your work is chattier than that.
+
+## What a finding is worth
+
+A finding is a lead, not a verdict. The deterministic tier is precise by construction, but the
+session patterns are heuristics, and a watcher that only spoke when it was certain would stay
+silent through most of an unattended run. Precision is measured, not promised: per rule, count
+findings, count the ones a human confirmed, and keep the ratio beside the rule. Two rules
+dominated this watcher's first six days of output, both mostly on benign commands, and both were
+repaired rather than defended. If your fleet's benign shapes differ, expect the same exercise on
+a different pair of rules.
 
 ## Limits
 
 - Tripwires are heuristics. The audit, or the agent's own explanation, clears benign hits.
 - A whole-file write to a test file cannot be compared against the previous version, so it is a
   `warn` and not a `high`.
-- Findings are kept per process and per session, bounded at 64 sessions and 300 events each.
+- Findings are kept per process and per session, bounded at 64 sessions and 300 events each. The
+  ledger is also written to `$HERMES_HOME/logs/ysk-watch/ledger/` so a restart does not erase
+  test evidence; it is restored only within a day of its last write.
 - The claim check understands English wording for tests and a green suite. It does not read your
   language.
+- A delegated child's command text never reaches the parent, so a "tests pass" claim that rests on
+  a child's work is reported as a warning with that gap stated, not as a confirmed failure.
 - The optional task-comment audit and the auxiliary model call use Hermes interfaces that can
   change between releases. Both are imported lazily, and the plugin fails open if they move.
+- If a tripwire raises, the failure is written to `checks.jsonl` as `guard_degraded`. A quiet run
+  and a blind run should not look the same.
 
 ## Development
 
 ```bash
-python -m pytest tests
-ruff check .
+# The plugin imports hermes_constants, so the Hermes runtime interpreter is the one that works.
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests
+ruff check . && ruff format --check .
 ```
 
 The tests are behaviour contracts: each one asserts an outcome (a finding exists, a nudge is not
-repeated, a profile's ledger stays isolated), not an internal implementation detail.
+repeated, a profile's ledger stays isolated), not an internal implementation detail. The push-guard
+and destructive-command cases build throwaway git repos, so they need `git` on `PATH` but no
+network.
+
+## Sibling tool
+
+[paperclips](https://github.com/dlorp/paperclips) is the two-directional friction log this
+watcher's thresholds came from. ysk-watch catches the shortcut in the act; paperclips gives the
+agent a place to file what it survived.
 
 ## License
 

@@ -370,3 +370,158 @@ def test_retried_task_is_not_commented_twice(ysk, monkeypatch):
         )
         ysk._on_kanban_task_completed(task_id="t_retry", summary="done", run_id=run)
     assert len(posted) == 1
+
+
+# --- precision: the push guard resolves the target at the push -------------------------------
+
+
+def test_push_text_inside_a_quoted_string_is_not_a_push(ysk):
+    _cmd(ysk, 'echo "git push origin main"')
+    assert _high(ysk) == []
+
+
+def test_shell_c_payload_is_still_a_push(ysk):
+    _cmd(ysk, 'bash -c "git push origin main"')
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_variable_indirected_git_dash_c_to_a_local_mirror_is_exempt(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "bare.git"))
+    _cmd(ysk, f"REPO={repo}; git -C $REPO push origin main")
+    assert [e for e in _high(ysk) if e["category"] == "forge_push_guard"] == []
+
+
+def test_compound_command_resolves_the_directory_at_the_push(ysk, tmp_path):
+    bare = _git_repo(tmp_path / "mirror", str(tmp_path / "bare.git"))
+    forge = _git_repo(tmp_path / "public", "git@github.com:dlorp/example.git")
+    _cmd(ysk, f"cd {forge} && cd {bare} && git push origin main")
+    assert [e for e in _high(ysk) if e["category"] == "forge_push_guard"] == []
+    _cmd(ysk, f"cd {bare} && cd {forge} && git push origin main")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+# --- precision: destructive severity follows the target --------------------------------------
+
+
+def test_recursive_delete_of_a_cache_path_is_info(ysk):
+    _cmd(ysk, "rm -rf ~/.cache/pip")
+    assert [e for e in _high(ysk) if e["category"] == "destructive_cmd"] == []
+    assert "destructive_cmd" in _cats(ysk)
+
+
+def test_recursive_delete_of_a_repository_is_high(ysk):
+    _cmd(ysk, "rm -rf ~/repos/example-project")
+    assert any(e["category"] == "destructive_cmd" for e in _high(ysk))
+
+
+def test_recursive_delete_of_an_unexpanded_variable_is_high(ysk):
+    _cmd(ysk, "rm -rf $TARGET")
+    assert any(e["category"] == "destructive_cmd" for e in _high(ysk))
+
+
+# --- evidence quality: the matched span, not the first 300 characters ------------------------
+
+
+def test_evidence_windows_around_a_match_past_the_prefix(ysk):
+    padding = "echo " + "x" * 400 + " && "
+    _cmd(ysk, padding + "rm -rf ~/repos/vault")
+    finding = next(e for e in _high(ysk) if e["category"] == "destructive_cmd")
+    assert "rm -rf" in finding["evidence"]
+    assert finding["evidence"].startswith("[")
+
+
+# --- evidence-aware claims -------------------------------------------------------------------
+
+
+def test_execute_code_payload_counts_as_test_evidence(ysk):
+    ysk._on_post_tool_call(
+        tool_name="execute_code",
+        args={"code": "import subprocess\nsubprocess.run(['pytest', '-q'], check=True)"},
+        result=json.dumps({"output": "31 passed", "exit_code": 0}),
+        status="ok",
+        session_id="s1",
+    )
+    assert (
+        ysk._on_pre_verify(
+            session_id="s1", final_response="All tests pass.", changed_paths=["a.py"]
+        )
+        is None
+    )
+
+
+def test_ledger_survives_a_process_restart(ysk):
+    _run(ysk, "pytest -q", 0)
+    ysk._ledgers.clear()
+    restored = [e for e in ysk._events("s1") if e.get("category") == "test_run"]
+    assert restored and restored[-1]["passed"] is True
+
+
+def test_delegated_work_downgrades_an_unverified_claim(ysk):
+    ysk._on_subagent_stop(
+        parent_session_id="s1",
+        child_role="coder",
+        tool_call_history=[{"tool_name": "terminal", "status": "ok", "tool_input": {}}],
+    )
+    claim = ysk._unverified_claim("All tests pass.", ysk._events("s1"))
+    assert claim and claim["severity"] == "warn"
+
+
+# --- D2: a truncated result cannot support a completeness claim ------------------------------
+
+
+def test_truncated_result_is_recorded_with_its_saved_path(ysk):
+    saved = "/tmp/out.log"
+    _cmd(
+        ysk,
+        "cat big.log",
+        output=f"line\nOUTPUT TRUNCATED\nfull output (9000 chars) saved to {saved}",
+    )
+    events = [e for e in ysk._events("s1") if e["category"] == "truncated_result"]
+    assert events and events[0]["saved_path"] == saved
+
+
+def test_completeness_claim_after_an_unread_truncation_is_flagged(ysk):
+    _cmd(ysk, "cat big.log", output="OUTPUT TRUNCATED\nfull output (900) saved to /tmp/x.log")
+    claim = ysk._truncated_claim("Reviewed all 400 entries.", ysk._events("s1"))
+    assert claim and claim["category"] == "truncated_result_unremarked"
+
+
+def test_completeness_claim_is_fine_when_the_saved_output_was_read(ysk):
+    path = "/tmp/x.log"
+    _cmd(ysk, "cat big.log", output=f"OUTPUT TRUNCATED\nfull output (900) saved to {path}")
+    _cmd(ysk, f"tail -n 400 {path}")
+    assert ysk._truncated_claim("Reviewed all 400 entries.", ysk._events("s1")) is None
+
+
+def test_a_partial_disclosure_is_not_a_completeness_claim(ysk):
+    _cmd(ysk, "cat big.log", output="OUTPUT TRUNCATED\nfull output (900) saved to /tmp/x.log")
+    assert ysk._truncated_claim("Reviewed a sample of the entries.", ysk._events("s1")) is None
+
+
+# --- D3: a passing run that predates the newest edit is stale evidence -----------------------
+
+
+def test_editing_source_after_a_passing_run_is_stale_evidence(ysk):
+    _run(ysk, "pytest -q", 0)
+    _patch(ysk, "app.py", "x = 1", "x = 2")
+    claim = ysk._stale_test_evidence("All tests pass.", ysk._events("s1"))
+    assert claim and claim["severity"] == "high"
+
+
+def test_doc_only_edit_after_a_passing_run_is_not_stale(ysk):
+    _run(ysk, "pytest -q", 0)
+    _patch(ysk, "README.md", "old", "new")
+    assert ysk._stale_test_evidence("All tests pass.", ysk._events("s1")) is None
+
+
+# --- a blind hook must not look like a clean run ---------------------------------------------
+
+
+def test_a_tripwire_crash_is_recorded_as_guard_degraded(ysk, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("tripwire exploded")
+
+    monkeypatch.setattr(ysk.tripwires, "scan_tool_call", boom)
+    _run(ysk, "ls", 0)
+    log = (ysk._home() / "logs" / "ysk-watch" / "checks.jsonl").read_text(encoding="utf-8")
+    assert "guard_degraded" in log
