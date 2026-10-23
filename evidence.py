@@ -166,7 +166,10 @@ def tree_fingerprint(
             if index_path and os.path.isfile(index_path):
                 try:
                     # The real index carries stat data, so unchanged files are not rehashed.
-                    shutil.copyfile(index_path, temp_index)
+                    # copy2 keeps the index file's mtime: git's racy-clean check compares
+                    # entries against it, and a fresh mtime would make a same-size edit made
+                    # within the same second as the last index write look unchanged.
+                    shutil.copy2(index_path, temp_index)
                     copied = True
                 except OSError:
                     copied = False

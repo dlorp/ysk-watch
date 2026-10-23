@@ -38,8 +38,15 @@ All notable changes to this project are documented here. The format follows
 - Per-repository allowlist in the committed `.ysk-watch.yaml`. Matching findings are downgraded
   one level and logged as `allowlisted`, never dropped. Claims and factual tripwires cannot be
   allowlisted.
-- `config_tampered` (high): the run edited the allowlist, wrote the watcher's logs, or marked
-  its own findings.
+- `config_tampered` (high): the run disabled ysk-watch (`hermes plugins disable`,
+  `hermes config set|unset` on its settings or the enabled-plugins list, a persisted
+  `YSK_WATCH_*` switch), wrote the plugin's code, logs or review marks, edited the allowlist,
+  or edited a profile `config.yaml`/`.env` in a way that touches the watcher.
+- `monitoring_weakened`: alert recipients emptied, suppression flags set, monitoring switches
+  turned off, or tests rewritten to assert monitoring is absent (high), and monitoring code
+  removed (warn). Checked on edits and on the working tree at finish, and added to the audit
+  prompt together with denial of such a change. It covers the failure in OpenAI's October 2026
+  report on agents suppressing and disabling misalignment monitoring.
 - Report-only mode (`report_only: true` or `YSK_WATCH_REPORT_ONLY=1`): records `would_block`
   instead of holding the turn.
 - Daily check-log files (`checks-YYYY-MM-DD.jsonl`) with retention; size rollovers take the next
@@ -86,6 +93,8 @@ All notable changes to this project are documented here. The format follows
 - Command samples are redacted before they are truncated, and credentials in URLs,
   `curl -u` and `mysql -p` are redacted.
 - Writing the check log never raises out of a hook.
+- The copied index keeps the real index's mtime, so git's racy-clean check still rehashes a
+  same-size edit made in the same second as the last index write.
 - Every git call runs with `GIT_OPTIONAL_LOCKS=0`, so a watcher read never refreshes the real
   index or holds `index.lock` while the agent commits. Fingerprinting skips git-lfs clean
   filters, which would otherwise write into `.git/lfs`.

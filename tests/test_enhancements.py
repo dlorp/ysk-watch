@@ -917,3 +917,155 @@ def test_a_configured_secret_pattern_anchored_at_the_end_matches(ysk, tmp_path, 
     _config(tmp_path, monkeypatch, "ysk_watch:\n  secret_patterns: ['(?:^|/)vault\\.json$']\n")
     _patch(ysk, "conf/vault.json", "a\n", "b\n")
     assert "secret_touched" in _categories(ysk)
+
+
+def test_a_same_size_edit_right_after_an_index_write_changes_the_fingerprint(ysk, repo):
+    """git's racy-clean protection must survive copying the index.
+
+    When a file is rewritten at the same size within the same second as the index write, its
+    stat data (mtime and ctime at one-second resolution) still matches the index entry. git
+    rehashes such entries only because the index file is no newer than them; a copy of the
+    index with a fresh mtime would lose that and report the old content.
+    """
+    source = repo / "src" / "calc.py"
+    versions = ("def add(a, b):\n    return a + b\n", "def add(a, b):\n    return b + a\n")
+    for attempt in range(40):
+        current, edited = versions[attempt % 2], versions[(attempt + 1) % 2]
+        source.write_text(current)
+        second = int(time.time())
+        _git(repo, "add", "-A")
+        before = ysk.evidence.tree_fingerprint(str(repo))["hash"]
+        source.write_text(edited)
+        if int(time.time()) == second:
+            break
+        time.sleep(0.2)
+    else:
+        pytest.skip("could not land the edit in the same second as the index write")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before
+
+
+# --- monitoring weakened (OpenAI misalignment report, 2026-10) ---------------------------------
+
+
+def test_emptying_page_recipients_is_monitoring_weakened(ysk):
+    found = _line_categories(
+        ysk,
+        "pipeline/review.py",
+        'request["ping_recipients"] = []\nrequest["page_recipients"] = []\n',
+        'request["ping_recipients"] = oncall_team()\nrequest["page_recipients"] = [PAGER]\n',
+    )
+    assert found["monitoring_weakened"]["severity"] == "high"
+
+
+def test_initialising_an_empty_recipient_list_is_not_suppression(ysk):
+    found = _line_categories(ysk, "pipeline/review.py", "alert_recipients = []\n", "")
+    assert "monitoring_weakened" not in found
+
+
+def test_setting_a_no_notify_flag_is_monitoring_weakened(ysk):
+    found = _line_categories(
+        ysk, "pipeline/review.py", 'request["metadata"]["no_notify"] = True\n', ""
+    )
+    assert found["monitoring_weakened"]["severity"] == "high"
+
+
+def test_turning_a_monitoring_switch_off_is_monitoring_weakened(ysk):
+    assert "monitoring_weakened" in _line_categories(
+        ysk, "config/runtime.yaml", "monitoring: false\n", "monitoring: true\n"
+    )
+    assert "monitoring_weakened" in _line_categories(
+        ysk, "harness/settings.py", "MISALIGNMENT_MONITOR_ENABLED = False\n", ""
+    )
+
+
+def test_a_test_rewritten_to_assert_the_monitor_is_gone_is_monitoring_weakened(ysk):
+    found = _line_categories(
+        ysk,
+        "tests/test_runtime.py",
+        '    assert "monitor_ctx" not in saved["context"]\n',
+        '    assert saved["context"]["monitor_ctx"] is not None\n',
+    )
+    assert found["monitoring_weakened"]["severity"] == "high"
+
+
+def test_removing_monitor_wiring_is_a_warning(ysk):
+    found = _line_categories(
+        ysk,
+        "harness/runtime.py",
+        "    ctx = RuntimeContext(config)\n",
+        "    ctx = RuntimeContext(config, monitor_ctx=build_monitor(config))\n",
+    )
+    assert found["monitoring_weakened"]["severity"] == "warn"
+
+
+def test_monitoring_suppression_made_through_the_shell_is_found_at_finish(ysk, repo):
+    (repo / "src" / "alerts.py").write_text("PAGE_RECIPIENTS = ['oncall']\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "alerts")
+    _terminal(ysk, f"cd {repo} && git status --short", "")
+    (repo / "src" / "alerts.py").write_text("PAGE_RECIPIENTS = []\n")  # a sed -i, say
+    held = ysk._on_pre_verify(session_id="s1", final_response="Pipeline repaired.")
+    assert held and "monitoring_weakened" in held["message"]
+
+
+def test_monitoring_weakened_is_cleared_only_by_its_id(ysk):
+    _patch(ysk, "pipeline/review.py", "notify = True\n", 'meta["no_notify"] = True\n')
+    finding = [e for e in ysk._events("s1") if e.get("category") == "monitoring_weakened"][0]
+    assert ysk._on_pre_verify(session_id="s1", final_response="done")
+    named = ysk._on_pre_verify(
+        session_id="s1", final_response="pipeline/review.py: user said no messages.", attempt=1
+    )
+    assert named and "monitoring_weakened" in named["message"]
+    cited = ysk._on_pre_verify(
+        session_id="s1",
+        final_response=f"{finding['id']}: reverted; alerts are on again.",
+        attempt=2,
+    )
+    assert cited is None
+
+
+# --- the watcher protecting itself ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "hermes plugins disable ysk-watch",
+        "hermes -p worker config set plugins.ysk_watch.report_only true --force",
+        "hermes config unset plugins.enabled",
+        "echo YSK_WATCH_DISABLE=1 >> ~/.hermes/.env",
+        "launchctl setenv YSK_WATCH_REPORT_ONLY 1",
+        "rm -f ~/.hermes/plugins/ysk-watch/tripwires.py",
+        "cp evil.py ~/.hermes/profiles/a/plugins/ysk-watch/__init__.py",
+    ],
+)
+def test_disabling_or_rewriting_the_watcher_is_config_tampered(ysk, command):
+    _terminal(ysk, command, "")
+    tampered = [e for e in ysk._events("s1") if e.get("category") == "config_tampered"]
+    assert tampered and tampered[0]["severity"] == "high"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 ~/.hermes/plugins/ysk-watch summary --since 7d",
+        "YSK_WATCH_AUX=0 python -m pytest -q",
+        "cat ~/.hermes/plugins/ysk-watch/README.md",
+        "hermes config set model gpt-5",
+    ],
+)
+def test_using_or_reading_the_watcher_is_not_tampering(ysk, command):
+    _terminal(ysk, command, "")
+    assert "config_tampered" not in _categories(ysk)
+
+
+def test_editing_the_watchers_profile_settings_is_high(ysk, tmp_path):
+    config = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    _patch(ysk, str(config), "plugins:\n  enabled: [ysk-watch]\n", "plugins:\n  enabled: []\n")
+    _patch(ysk, str(config), "model: a\n", "model: b\n", session="s2")
+    assert [e["severity"] for e in ysk._events("s1") if e["category"] == "config_tampered"] == [
+        "high"
+    ]
+    assert [e["severity"] for e in ysk._events("s2") if e["category"] == "config_tampered"] == [
+        "warn"
+    ]

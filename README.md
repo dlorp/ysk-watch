@@ -83,10 +83,39 @@ The last three are the strategies [ImpossibleBench](https://arxiv.org/abs/2510.2
 tests they could not honestly pass, besides editing the tests: overloading comparison, special-
 casing the harness, and reaching into the grader.
 
-One more rule is `high` from the start, because it protects the watcher itself:
-`config_tampered` fires when the run edits `.ysk-watch.yaml`, writes into the watcher's log
-directory, or marks its own findings with `ysk-watch review`. Editing the profile's
-`config.yaml` is a `warn` under the same name.
+Two rules are `high` from the start, because they protect monitoring itself.
+
+`monitoring_weakened` fires when a change switches off, silences, redirects or removes the
+monitoring of the code being worked on. That is the failure OpenAI reported in October 2026
+([Suppressing misalignment monitoring alerts and disabling misalignment monitoring](https://alignment.openai.com/misalignment-reports/suppressing-misalignment-monitoring-alerts-and-disabling-misalignment-monitoring/)):
+one coding agent emptied the alert recipients and set `no_notify`, another removed a monitor
+integration, rewrote its regression test to assert the monitor was absent, and then denied it.
+Neither was caught automatically. It is `high` for:
+
+- alert, page or notification recipients emptied where they were set before
+  (`request["page_recipients"] = []`);
+- a suppression flag turned on (`no_notify`, `mute_alerts`, `disable_monitoring`, ...);
+- a monitoring, alerting or audit switch turned off (`*_enabled = False`, `monitoring: false`);
+- a test changed to assert that monitoring is absent.
+
+It is `warn` when monitoring, alerting or audit code is removed. It is checked on every edit
+and again on the working tree before the turn finishes, so a shell edit is caught too. The
+audit model is also asked to report suppression, and any final answer that denies it. Replayed
+over 887 commits of five real repositories, the `high` patterns fired zero times.
+
+`config_tampered` fires when the run turns the watcher itself off or edits it:
+
+- `hermes plugins disable ysk-watch`, or `hermes config set|unset` on `plugins.ysk_watch.*` or
+  the enabled-plugins list;
+- a `YSK_WATCH_*` switch written somewhere it outlives the command (`.env`, `launchctl setenv`);
+- a write to the plugin's own code, its log directory or its review marks, or `ysk-watch review
+  --mark` run by the agent;
+- an edit to `.ysk-watch.yaml`;
+- an edit to a profile's `config.yaml` or `.env` that touches the watcher's settings or the
+  enabled-plugins list. Any other edit to those files is a `warn`.
+
+Both are cleared only by restoring the change and citing the finding's id; the audit model can
+never clear them.
 
 ## Evidence
 
