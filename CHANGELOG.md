@@ -116,6 +116,12 @@ All notable changes to this project are documented here. The format follows
 - Configured secret patterns are matched against the bare path or command, so `^` and `$`
   anchors work as written.
 - CI actions moved to checkout v7.0.1 and setup-python v7.1.0, pinned by commit SHA, with a
-  read-only `contents` permission.
+  read-only `contents` permission. The suite runs on Ubuntu (Python 3.11-3.14) and macOS (3.11,
+  3.14), again with only `ruamel.yaml` installed, with pinned dev requirements, superseded runs
+  cancelled, and Dependabot for actions and dev requirements. A manifest test checks hooks,
+  version and license against the code, CHANGELOG and LICENSE.
+- The git fingerprint ignores untracked caches (`__pycache__`, `.pyc`, tool caches,
+  virtualenvs, `node_modules`), so a Python run after a green run does not make it stale in a
+  repository that does not ignore them.
 
 [0.6.0]: https://github.com/dlorp/ysk-watch/compare/81e83ab...v0.6.0

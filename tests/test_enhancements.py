@@ -478,8 +478,19 @@ def test_summary_groups_findings_by_rule_session_and_repo(ysk, capsys):
 # --- D: configuration, allowlist, report-only, rotation --------------------------------------
 
 
+def _needs_yaml():
+    """The plugin reads YAML with PyYAML or, failing that, ruamel.yaml; either will do."""
+    for name in ("yaml", "ruamel.yaml"):
+        try:
+            importlib.import_module(name)
+            return
+        except ImportError:
+            continue
+    pytest.skip("neither PyYAML nor ruamel.yaml is installed")
+
+
 def _config(tmp_path, monkeypatch, text):
-    pytest.importorskip("yaml")
+    _needs_yaml()
     path = tmp_path / "ysk.yaml"
     path.write_text(text)
     monkeypatch.setenv("YSK_WATCH_CONFIG", str(path))
@@ -519,7 +530,7 @@ def _skip_in_repo(ysk, repo):
 
 
 def test_a_committed_allowlist_downgrades_an_expected_finding(ysk, repo):
-    pytest.importorskip("yaml")
+    _needs_yaml()
     (repo / ".ysk-watch.yaml").write_text(_ALLOW)
     _git(repo, "add", ".ysk-watch.yaml")
     _git(repo, "commit", "-q", "-m", "allowlist")
@@ -530,14 +541,14 @@ def test_a_committed_allowlist_downgrades_an_expected_finding(ysk, repo):
 
 
 def test_an_uncommitted_allowlist_has_no_effect(ysk, repo):
-    pytest.importorskip("yaml")
+    _needs_yaml()
     (repo / ".ysk-watch.yaml").write_text(_ALLOW)
     found = _skip_in_repo(ysk, repo)
     assert found and found[0]["severity"] == "high"
 
 
 def test_an_allowlist_committed_mid_session_does_not_cover_high_findings(ysk, repo):
-    pytest.importorskip("yaml")
+    _needs_yaml()
     (repo / ".ysk-watch.yaml").write_text("allow:\n  - rule: test_rewritten\n")
     _git(repo, "add", ".ysk-watch.yaml")
     _git(repo, "commit", "-q", "-m", "allowlist v1")
@@ -551,7 +562,7 @@ def test_an_allowlist_committed_mid_session_does_not_cover_high_findings(ysk, re
 
 
 def test_wildcards_and_factual_rules_cannot_be_allowlisted(ysk, repo):
-    pytest.importorskip("yaml")
+    _needs_yaml()
     (repo / ".ysk-watch.yaml").write_text(
         "allow:\n  - rule: '*'\n  - rule: secret_touched\n  - rule: destructive_cmd\n"
     )
@@ -1269,3 +1280,18 @@ def test_an_honest_exit_is_not_annotated(ysk):
 def test_final_notice_can_be_turned_off(ysk, tmp_path, monkeypatch):
     _config(tmp_path, monkeypatch, "ysk_watch:\n  final_notice: false\n")
     assert _deliver(ysk, "All tests pass.") is None
+
+
+def test_untracked_caches_do_not_change_the_fingerprint(ysk, repo):
+    """A repository that does not ignore __pycache__ must not go stale on a .pyc rewrite."""
+    before = ysk.evidence.tree_fingerprint(str(repo))["hash"]
+    cache = repo / "src" / "__pycache__"
+    cache.mkdir()
+    (cache / "calc.cpython-311.pyc").write_bytes(b"\x00\x01")
+    (repo / ".pytest_cache").mkdir()
+    (repo / ".pytest_cache" / "README.md").write_text("cache")
+    (repo / "node_modules" / "x").mkdir(parents=True)
+    (repo / "node_modules" / "x" / "index.js").write_text("module.exports = 1\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before

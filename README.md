@@ -436,13 +436,19 @@ against reviewed outcomes once there are enough of them.
 ## Development
 
 ```bash
-# conftest.py stubs hermes_constants, so any Python 3.11+ with pytest runs the suite. The
-# configuration and allowlist cases parse YAML with PyYAML and are skipped without it (the
-# plugin itself falls back to ruamel.yaml; the tests do not).
-python3 -m pip install pytest pyyaml ruff
+# conftest.py stubs hermes_constants, so any Python 3.11-3.14 with pytest runs the suite.
+python3 -m pip install -r requirements-dev.txt   # pinned pytest, PyYAML, ruff
 python3 -m pytest tests
 ruff check . && ruff format --check .
 ```
+
+CI ([tests.yml](.github/workflows/tests.yml)) runs lint and format once, the suite on Ubuntu
+with Python 3.11 to 3.14 and on macOS with 3.11 and 3.14, and the suite again with only
+`ruamel.yaml` installed, the YAML library a bare Hermes install has. Actions are pinned by
+commit SHA, and [Dependabot](.github/dependabot.yml) proposes updates to them and to
+[requirements-dev.txt](requirements-dev.txt) weekly. [test_manifest.py](tests/test_manifest.py)
+keeps `plugin.yaml` honest: its hooks must match what `register()` registers, its version the
+newest CHANGELOG entry, and its license the LICENSE file.
 
 The tests are behaviour contracts: each one asserts an outcome (a finding exists, a nudge is not
 repeated, a profile's ledger stays isolated), not an internal implementation detail. The push-guard,

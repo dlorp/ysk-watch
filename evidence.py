@@ -113,6 +113,32 @@ def changed_paths(directory: Optional[str]) -> List[str]:
     return _status_paths(directory)[:_MAX_LISTED_PATHS]
 
 
+# Never source, and rewritten by any Python or Node run: a repository that does not ignore
+# them must not see a green run go stale because ``python -c`` wrote a ``.pyc``.
+_CACHE_NAMES = (
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".eggs",
+    "htmlcov",
+)
+_CACHE_PATH_RE = re.compile(
+    r"(?:^|/)(?:" + "|".join(re.escape(name) for name in _CACHE_NAMES) + r")/|\.py[co]$|"
+    r"(?:^|/)\.coverage(?:\.[^/]*)?$|\.egg-info/"
+)
+_CACHE_PATHSPECS = [f":(exclude,glob)**/{name}/**" for name in _CACHE_NAMES] + [
+    ":(exclude,glob)**/*.py[co]",
+    ":(exclude,glob)**/.coverage*",
+    ":(exclude,glob)**/*.egg-info/**",
+]
+
+
 def _git_path(root: str, name: str) -> Optional[str]:
     value = git(root, ["rev-parse", "--git-path", name]).strip()
     if not value:
@@ -148,7 +174,7 @@ def tree_fingerprint(
     objects_path = _git_path(root, "objects")
     if not objects_path:
         return None
-    paths = _status_paths(root)
+    paths = [path for path in _status_paths(root) if not _CACHE_PATH_RE.search(path)]
     docs = [path for path in paths if is_doc(path)] if not include_docs else []
     code_paths = [path for path in paths if path not in docs]
     try:
@@ -194,6 +220,7 @@ def tree_fingerprint(
                     "-A",
                     "--",
                     ".",
+                    *_CACHE_PATHSPECS,
                 ],
                 env=env,
                 timeout=_STAGE_TIMEOUT_S,
