@@ -63,8 +63,16 @@ _HELP_MIN = 3
 _BLOCKED_MIN = 3
 _NOT_FOUND_MIN = 3
 _MAX_FINDINGS_PER_NUDGE = 5  # keep one nudge scannable
-_REPORTED_HISTORY = 50  # remember the last 50 reported findings: no duplicate comments
+_REPORTED_HISTORY = 50  # remember the last 50 reported findings per task
+_MAX_REPORTED_TASKS = 200  # tasks remembered before the oldest is forgotten
+_MAX_COMMENT_FINDINGS = 40  # a comment stays finite but every finding is shown
 _LEDGER_RESTORE_S = 24 * 3600  # restore a persisted ledger only within a day
+_MAX_CHECKS_BYTES = 2 * 1024 * 1024  # checks.jsonl rotates at this size
+_MAX_LEDGER_BYTES = 4 * 1024 * 1024  # per-session ledger trims at this size
+# Facts a model may not overturn: the ledger either has a passing run or it does not.
+_DETERMINISTIC_CATEGORIES = frozenset(
+    {"unverified_claim", "stale_test_evidence", "truncated_result_unremarked"}
+)
 
 _lock = threading.Lock()
 # (home_key, session_or_task_id) -> {"events": deque, "aux_calls": int, "reported": set}
@@ -126,8 +134,29 @@ def _persist_events(key_id: str, events: List[Dict[str, Any]]) -> None:
         with path.open("a", encoding="utf-8") as fh:
             for event in events:
                 fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        _trim_ledger_file(path)
     except OSError as exc:
         logger.debug("ysk-watch: could not persist ledger: %s", exc)
+
+
+def _trim_ledger_file(path: Path) -> None:
+    """Keep the on-disk ledger bounded: rewrite with the newest events once it is large."""
+    try:
+        if path.stat().st_size <= _MAX_LEDGER_BYTES:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()[-_MAX_EVENTS:]
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("ysk-watch: could not trim ledger: %s", exc)
+
+
+def _rotate(path: Path, limit: int) -> None:
+    """Rotate a log once past ``limit``: one backup, then a fresh file."""
+    try:
+        if path.exists() and path.stat().st_size > limit:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError as exc:
+        logger.debug("ysk-watch: could not rotate %s: %s", path.name, exc)
 
 
 def _ledger(key_id: str) -> Dict[str, Any]:
@@ -162,12 +191,24 @@ def _ledger_ids(session_id: str = "", task_id: str = "") -> List[str]:
 
 
 def _record(ids: List[str], events: List[Dict[str, Any]]) -> None:
+    """Append events to every ledger for this call, redacted and sequence-numbered.
+
+    Credentials are stripped here, before anything is persisted or audited, because a token
+    that reaches the ledger is already on disk and a token in the payload is already at the
+    provider. Ordering uses a per-ledger counter rather than wall-clock time: two events can
+    land in the same millisecond, and the clock can move backwards.
+    """
     if not events:
         return
-    stamped = [dict(e, ts=round(time.time(), 3)) for e in events]
+    clean = [tripwires.redact_obj(dict(event)) for event in events]
     for key_id in ids:
         led = _ledger(key_id)
         with _lock:
+            start = max((int(event.get("seq") or 0) for event in led["events"]), default=0)
+            stamped = [
+                dict(event, ts=round(time.time(), 3), seq=start + index + 1)
+                for index, event in enumerate(clean)
+            ]
             led["events"].extend(stamped)
         _persist_events(key_id, stamped)
 
@@ -177,10 +218,13 @@ def _log_check(kind: str, payload: Dict[str, Any]) -> None:
     try:
         log_dir = _home() / "logs" / "ysk-watch"
         log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / "checks.jsonl"
+        _rotate(path, _MAX_CHECKS_BYTES)
         line = json.dumps(
-            {"ts": round(time.time(), 3), "kind": kind, **payload}, ensure_ascii=False
+            tripwires.redact_obj({"ts": round(time.time(), 3), "kind": kind, **payload}),
+            ensure_ascii=False,
         )
-        with (log_dir / "checks.jsonl").open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError as exc:
         logger.debug("ysk-watch: could not write checks log: %s", exc)
@@ -202,11 +246,24 @@ def _on_post_tool_call(
         return
     ids = _ledger_ids(session_id, task_id)
     try:
-        findings = tripwires.scan_tool_call(tool_name, args, result, status)
+        known_cwd = _last_cwd(ids[0])
+        findings = tripwires.scan_tool_call(tool_name, args, result, status, cwd=known_cwd)
         findings += _behaviour_findings(ids, tool_name, args, result)
         commands = ("terminal", "execute_code", "shell", "bash")
         if tool_name in commands:
             command = tripwires._command_of(args)
+            moved = tripwires.command_cwd(command, known_cwd)
+            if moved and moved != known_cwd:
+                # The terminal tool's cwd is not this process's cwd. Remember where it is so
+                # a later push or working-tree diff resolves against the right repository.
+                findings.append(
+                    {
+                        "category": "cwd",
+                        "severity": "info",
+                        "claim": "working directory for later commands",
+                        "evidence": moved,
+                    }
+                )
             saved = {
                 str(e.get("saved_path"))
                 for e in _events(ids[0])
@@ -321,6 +378,27 @@ def _events(key_id: str) -> List[Dict[str, Any]]:
         return list(led["events"])
 
 
+def _last_cwd(key_id: str) -> Optional[str]:
+    """The directory the terminal tool was last seen in, if a command moved it."""
+    for event in reversed(_events(key_id)):
+        if event.get("category") == "cwd" and event.get("evidence"):
+            return str(event["evidence"])
+    return None
+
+
+def _already_recorded(finding: Dict[str, Any], events: List[Dict[str, Any]]) -> bool:
+    """True when an equivalent finding already sits in the ledger."""
+    category = finding.get("category")
+    evidence = str(finding.get("evidence") or "")
+    first = evidence.split(",")[0].strip()
+    if not first:
+        return False
+    return any(
+        event.get("category") == category and first in str(event.get("evidence") or "")
+        for event in events
+    )
+
+
 def _unverified_claim(text: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """A final answer claiming tests passed, with no passing test run in the ledger.
 
@@ -368,13 +446,13 @@ def _stale_test_evidence(text: str, events: List[Dict[str, Any]]) -> Optional[Di
     passes = [e for e in events if e.get("category") == "test_run" and e.get("passed") is True]
     if not passes:
         return None
-    last_pass = max(float(e.get("ts") or 0) for e in passes)
+    last_pass = max(int(e.get("seq") or 0) for e in passes)
     edits = [
         e
         for e in events
         if e.get("category") == "edit" and not tripwires.is_doc_path(str(e.get("evidence") or ""))
     ]
-    newer = [e for e in edits if float(e.get("ts") or 0) > last_pass]
+    newer = [e for e in edits if int(e.get("seq") or 0) > last_pass]
     if not newer:
         return None
     return {
@@ -454,7 +532,18 @@ def _on_pre_verify(
             )
             if c
         ]
+        diff_findings = [
+            finding
+            for finding in tripwires.scan_git_diff(changed_paths or [], _last_cwd(key_id))
+            if not _already_recorded(finding, events)
+        ]
+        if diff_findings:
+            _log_check(
+                "diff_scan",
+                {"session_id": session_id, "attempt": attempt, "findings": diff_findings},
+            )
         high = _new_high(events, led["reported"])
+        high.extend(diff_findings)
         high.extend(c for c in claims if c.get("severity") == "high")
         noted = [c for c in claims if c.get("severity") != "high"]
         if noted:
@@ -474,7 +563,11 @@ def _on_pre_verify(
                 changed_paths=changed_paths or [],
             )
             if audit is not None:  # model ran: keep tripwires it did not clear
-                cleared = {(c.get("category"), c.get("evidence")) for c in audit.get("cleared", [])}
+                cleared = {
+                    (c.get("category"), c.get("evidence"))
+                    for c in audit.get("cleared", [])
+                    if c.get("category") not in _DETERMINISTIC_CATEGORIES
+                }
                 confirmed = [
                     e for e in high if (e.get("category"), e.get("evidence")) not in cleared
                 ]
@@ -534,12 +627,20 @@ def _on_kanban_task_completed(
                 changed_paths=_edited_paths(events),
             )
             if audit is not None:
-                cleared = {(c.get("category"), c.get("evidence")) for c in audit.get("cleared", [])}
+                cleared = {
+                    (c.get("category"), c.get("evidence"))
+                    for c in audit.get("cleared", [])
+                    if c.get("category") not in _DETERMINISTIC_CATEGORIES
+                }
                 findings = [
                     f for f in findings if (f.get("category"), f.get("evidence")) not in cleared
                 ]
                 findings += audit.get("findings", [])
-        findings = _not_yet_reported(task_id, findings)
+        order = {"high": 0, "warn": 1, "info": 2}
+        findings.sort(key=lambda f: order.get(f.get("severity"), 3))
+        # Only findings that actually reach the comment are marked reported, so a finding
+        # past the cap is not silently swallowed.
+        findings = _not_yet_reported(task_id, findings[:_MAX_COMMENT_FINDINGS])
         if not findings:
             return
         _post_kanban_comment(task_id, findings, run_id)
@@ -551,25 +652,32 @@ def _on_kanban_task_completed(
 def _not_yet_reported(task_id: str, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Drop findings already reported for this task in an earlier run (retries re-run workers).
 
-    Keeps the last ``_REPORTED_HISTORY`` keys per profile in ``logs/ysk-watch/reported.json``.
+    History is keyed per task, so a busy profile cannot push an older task's keys out and
+    make its findings post again. Only findings actually handed to the comment are marked.
     """
     path = _home() / "logs" / "ysk-watch" / "reported.json"
     try:
-        history = json.loads(path.read_text(encoding="utf-8"))
-        history = history if isinstance(history, list) else []
+        stored = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        history = []
-    seen = set(history)
-    fresh = []
-    for f in findings:
-        key = f"{task_id}|{f.get('category')}|{f.get('evidence')}"
-        if key not in seen:
-            fresh.append(f)
-            seen.add(key)
-            history.append(key)
+        stored = {}
+    history: Dict[str, List[str]] = stored if isinstance(stored, dict) else {}
+    seen = set(history.get(task_id) or [])
+    fresh: List[Dict[str, Any]] = []
+    keys: List[str] = []
+    for finding in findings:
+        key = f"{finding.get('category')}|{finding.get('evidence')}"
+        if key in seen:
+            continue
+        fresh.append(finding)
+        seen.add(key)
+        keys.append(key)
+    if keys:
+        history[task_id] = list(history.get(task_id) or []) + keys
+        history[task_id] = history[task_id][-_REPORTED_HISTORY:]
+        history = dict(list(history.items())[-_MAX_REPORTED_TASKS:])
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(history[-_REPORTED_HISTORY:]), encoding="utf-8")
+        path.write_text(json.dumps(history), encoding="utf-8")
     except OSError as exc:
         logger.debug("ysk-watch: could not persist reported history: %s", exc)
     return fresh
@@ -582,17 +690,22 @@ def _post_kanban_comment(task_id: str, findings: List[Dict[str, Any]], run_id: A
         f"ysk-watch audit (run {run_id}): {len(findings)} finding(s) "
         "the coordinator should know about."
     ]
-    for f in findings[:10]:
+    for f in findings[:_MAX_COMMENT_FINDINGS]:
         body.append(
             f"- [{f.get('severity')}] {f.get('category')}: {f.get('claim')} "
             f"— evidence: {f.get('evidence')}"
+        )
+    if len(findings) > _MAX_COMMENT_FINDINGS:
+        body.append(
+            f"- and {len(findings) - _MAX_COMMENT_FINDINGS} more finding(s) in "
+            "logs/ysk-watch/checks.jsonl"
         )
     try:
         from hermes_cli.kanban_db import add_comment
         from hermes_cli.kanban_db_connect import connect_closing
 
         with connect_closing() as conn:
-            add_comment(conn, task_id, "ysk-watch", "\n".join(body))
+            add_comment(conn, task_id, "ysk-watch", tripwires.redact("\n".join(body)))
     except Exception as exc:
         logger.debug("ysk-watch: kanban comment failed: %s", exc)
 
@@ -673,15 +786,19 @@ def _aux_audit(
     flagged = [e for e in events if e.get("severity") in ("high", "warn")]
     evidence_runs = [e for e in events if e.get("category") == "test_run"][-5:]
     payload = json.dumps(
-        {
-            "purpose": purpose,
-            "changed_paths": changed_paths[:40],
-            "flags": flagged[-40:],
-            "test_runs": evidence_runs,
-        },
+        tripwires.redact_obj(
+            {
+                "purpose": purpose,
+                "changed_paths": changed_paths[:40],
+                "flags": flagged[-40:],
+                "test_runs": evidence_runs,
+            }
+        ),
         ensure_ascii=False,
     )
-    user = f"LEDGER:\n{payload[:_AUX_INPUT_CHARS]}\n\nFINAL TEXT:\n{final_text[:6000]}"
+    final = tripwires.redact(final_text[:6000])
+    user = f"LEDGER:\n{payload[:_AUX_INPUT_CHARS]}\n\nFINAL TEXT:\n{final}"
+    haystack = " ".join(f"{payload}\n{final}".split()).lower()
     started = time.monotonic()
     try:
         from agent.auxiliary_client import call_llm
@@ -712,10 +829,17 @@ def _aux_audit(
     )
     if parsed is None:
         return None
+
+    def quoted(evidence: Any) -> bool:
+        needle = " ".join(str(evidence or "").split()).lower()
+        return bool(needle) and needle in haystack
+
     parsed["findings"] = [
         f
         for f in parsed.get("findings", [])
-        if isinstance(f, dict) and f.get("evidence") and f.get("severity") in ("high", "warn")
+        if isinstance(f, dict)
+        and f.get("severity") in ("high", "warn")
+        and quoted(f.get("evidence"))
     ]
     parsed["cleared"] = [c for c in parsed.get("cleared", []) if isinstance(c, dict)]
     return parsed

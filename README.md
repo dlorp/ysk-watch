@@ -1,7 +1,7 @@
 # ysk-watch
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-49%20passing-brightgreen)]()
+[![Tests](https://github.com/dlorp/ysk-watch/actions/workflows/tests.yml/badge.svg)](https://github.com/dlorp/ysk-watch/actions/workflows/tests.yml)
 [![Hermes](https://img.shields.io/badge/hermes-0.21.5%2B-informational)]()
 
 An integrity watcher for autonomous agents. It catches the shortcuts an agent takes to make a run
