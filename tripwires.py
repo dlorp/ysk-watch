@@ -61,8 +61,13 @@ class _AnyOf:
         self.patterns = patterns
 
     def search(self, text: str) -> Optional["re.Match[str]"]:
-        for pattern in self.patterns:
-            match = pattern.search(text)
+        """The built-in rule sees the text as given; configured patterns see it stripped.
+
+        Callers pad a path with spaces for the built-in rule's boundary groups. A team's own
+        pattern is written against the bare path, so ``$`` and ``^`` mean what they say.
+        """
+        for index, pattern in enumerate(self.patterns):
+            match = pattern.search(text if index == 0 else text.strip())
             if match:
                 return match
         return None

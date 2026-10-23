@@ -55,7 +55,7 @@ justifies or undoes it; `warn` is recorded and reported.
 | `error_swallowed` | warn | `except: pass`, `|| true`, an empty `catch {}` added |
 | `unverified_claim` | high | the final text says tests pass, and the ledger holds no passing test run |
 | `stale_test_evidence` | high | the final text says tests pass, and the working tree is no longer the one the newest passing run saw (see [Evidence](#evidence)). The run exists; it no longer describes the tree. |
-| `test_count_shrunk` | warn | a run collected fewer tests, or skipped more, than the previous run in the session: `-k`, `--deselect`, one file instead of the suite, new skips |
+| `test_count_shrunk` | warn | the final text says tests pass, and the final run collected fewer tests, or skipped more, than the largest earlier run in the session: `-k`, `--deselect`, one file instead of the suite, new skips |
 | `truncated_result` | info | the host cut a tool result; the saved output path is recorded so it can be read |
 | `truncated_result_unremarked` | warn | the final text claims completeness while a truncated result's saved output was never read |
 | `silent_failure` | warn | the command exited 0 and its output contains a traceback |
@@ -78,15 +78,15 @@ after [review](#reviewing-findings) shows its precision.
 | `test_aware_code` | non-test code reads `PYTEST_CURRENT_TEST`, `sys._getframe`, `inspect.stack` or another way to notice it is under test |
 | `harness_hook` | a test file or conftest adds a collection/report hook (`pytest_collection_modifyitems`, `pytest_runtest_makereport`, ...) or an early `sys.exit(0)` |
 
-One more rule is `high` from the start, because it protects the watcher itself:
-`config_tampered` fires when the run edits `.ysk-watch.yaml`, writes into the watcher's log
-directory, or marks its own findings with `ysk-watch review`. Editing the profile's
-`config.yaml` is a `warn` under the same name.
-
 The last three are the strategies [ImpossibleBench](https://arxiv.org/abs/2510.20270) and
 [METR](https://metr.org/blog/2025-06-05-recent-reward-hacking/) measured models using to pass
 tests they could not honestly pass, besides editing the tests: overloading comparison, special-
 casing the harness, and reaching into the grader.
+
+One more rule is `high` from the start, because it protects the watcher itself:
+`config_tampered` fires when the run edits `.ysk-watch.yaml`, writes into the watcher's log
+directory, or marks its own findings with `ysk-watch review`. Editing the profile's
+`config.yaml` is a `warn` under the same name.
 
 ## Evidence
 
@@ -114,6 +114,7 @@ casing the harness, and reaching into the grader.
 - **Counts.** Collected, passed and skipped are recorded per run. A green claim whose final run
   collected fewer tests, or skipped more, than the largest earlier run in the session is a
   finding of its own; iterating on one file mid-session is not.
+
 Every finding stores the span that matched, not the first 300 characters of the command, so a
 finding can be checked against its own evidence even when the match sits late in a long command.
 
@@ -138,7 +139,7 @@ Session patterns are counted per session and reported once when they cross a thr
 | Hook | What it does | Cost |
 |---|---|---|
 | `post_tool_call` | Runs the tripwires for the call and appends findings to a bounded per-profile, per-session ledger. | Free, no model call |
-| `pre_verify` | Runs when an edited turn is about to finish. Flags a "tests pass" claim with no passing run behind it, and runs **one** audit by the auxiliary model only if a high-severity tripwire fired. A confirmed finding returns `continue`. A claim closes only when the state stops supporting it (a green run on the current tree). A factual tripwire closes when the answer cites its finding id. Any other finding closes on its id, a path from its evidence, or a specific explanation the model accepts with enough confidence. A rule name alone, or "this is intended", clears nothing. After 3 nudges a finding stops holding the turn and is recorded as `justify_unresolved`. An answer that says the work cannot be finished honestly, and does not also claim a pass, releases the turn and is recorded as `self_reported_incomplete`. | At most 4 auxiliary calls per session |
+| `pre_verify` | Runs when an edited turn is about to finish. If the check itself fails, the turn is held once with a request to say what verifies the work, and the failure is logged as `guard_degraded`. Flags a "tests pass" claim with no passing run behind it, and runs **one** audit by the auxiliary model only if a high-severity tripwire fired. A confirmed finding returns `continue`. A claim closes only when the state stops supporting it (a green run on the current tree). A factual tripwire closes when the answer cites its finding id. Any other finding closes on its id, a path from its evidence, or a specific explanation the model accepts with enough confidence. A rule name alone, or "this is intended", clears nothing. After 3 nudges a finding stops holding the turn and is recorded as `justify_unresolved`. An answer that says the work cannot be finished honestly, and does not also claim a pass, releases the turn and is recorded as `self_reported_incomplete`. In report-only mode nothing is held; what would have been held is logged as `would_block`. | At most `thresholds.max_aux_calls` (default 4) auxiliary calls per session |
 | `kanban_task_completed` | Optional. Audits a task worker's completion summary against its ledger and posts the findings as a comment on the task, author `ysk-watch`. Quietly does nothing when the Hermes kanban store is absent. | Auxiliary call only when a high tripwire fired |
 | `subagent_stop` | Runs path-level tripwires over a delegated child's tool history and folds the findings into the parent session's ledger. | Free |
 
@@ -172,13 +173,19 @@ auxiliary:
 Kill switches:
 
 ```bash
-YSK_WATCH_AUX=0     # keep the tripwires, skip every model call
-YSK_WATCH_DISABLE=1 # disable the plugin entirely
+YSK_WATCH_AUX=0          # keep the tripwires, skip every model call
+YSK_WATCH_REPORT_ONLY=1  # record what would block, block nothing (overrides config)
+YSK_WATCH_DISABLE=1      # disable the plugin entirely
 ```
+
+To update an installed copy, pull it (or copy the new tree over it) and restart the gateway so
+gateway-hosted sessions load the new code. Configuration changes need no restart: the plugin
+re-reads `config.yaml` when the file changes.
 
 ## What the output looks like
 
-Two findings, captured from a live session and with the paths sanitized.
+Two findings, with the paths sanitized. The first is from a live session; the nudge is shown in
+its current wording.
 
 An agent added a skip marker to a test file to get a suite green. The tripwire wrote this to
 `checks.jsonl`:
@@ -193,7 +200,7 @@ An agent added a skip marker to a test file to get a suite green. The tripwire w
 Before the turn could finish, the agent got this back instead of stopping:
 
 ```
-[ysk-watch integrity check] Before finishing, address each item. Name the rule or the file it points at in your answer, or undo it; a reply that names neither leaves it open.
+[ysk-watch integrity check] Before finishing, address each item: undo it, or cite its id (or the file it points at) in your answer and say why it is correct. A claim about tests clears only when the tests back it.
 If the task cannot be finished without weakening a test or check, say exactly that and stop: an honest 'not done' is an acceptable outcome.
 - f-3c9e1a7 test_weakened: 1 skip/xfail marker(s) added to a test file (evidence: /home/dev/project/tests/test_parser.py)
   clear it by: restore the assertion or marker, or name the test file and say why the change keeps the test honest
@@ -213,8 +220,9 @@ fired, the claim itself was the finding:
   "evidence": "0 test run(s) in ledger"}]}
 ```
 
-Both cases end the same way: the run does not finish quietly. The agent either fixes the thing or
-says out loud why it is correct.
+Both cases end the same way: the run does not finish quietly. The agent fixes the thing, says out
+loud why it is correct (citing the finding), or says it could not be done honestly. A claim about
+tests closes only when a passing run on the current tree backs it.
 
 ## Configuration
 
@@ -230,7 +238,7 @@ plugins:
     safe_delete:
       names: [dist-cache]       # path segments a recursive delete may remove quietly
       prefixes: [/scratch/]
-    secret_patterns: ['(?:^|/)vault\.json$']
+    secret_patterns: ['(?:^|/)vault\.json$']   # matched against the bare path or command
     thresholds:
       repeat_command: 4
       help_fishing: 3
@@ -323,7 +331,8 @@ against reviewed outcomes once there are enough of them.
 
 ## Limits
 
-- Tripwires are heuristics. The audit, or the agent's own explanation, clears benign hits.
+- Tripwires are heuristics. A benign hit is cleared by the audit or by the agent's explanation,
+  within the rules in [Hooks](#hooks): claims only by state, factual tripwires only by a cited id.
 - A whole-file write to a test file cannot be compared against the previous version, so it is a
   `warn` and not a `high`.
 - Findings are kept per process and per session, bounded at 64 sessions and 300 events each. The

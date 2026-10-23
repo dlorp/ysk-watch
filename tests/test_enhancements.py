@@ -911,3 +911,9 @@ def test_fingerprinting_never_writes_the_real_index(ysk, repo):
     assert ysk.evidence.tree_fingerprint(str(repo))
     ysk.evidence.snapshot(str(repo))
     assert index.stat().st_mtime_ns == before
+
+
+def test_a_configured_secret_pattern_anchored_at_the_end_matches(ysk, tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, "ysk_watch:\n  secret_patterns: ['(?:^|/)vault\\.json$']\n")
+    _patch(ysk, "conf/vault.json", "a\n", "b\n")
+    assert "secret_touched" in _categories(ysk)

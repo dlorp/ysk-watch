@@ -94,6 +94,8 @@ All notable changes to this project are documented here. The format follows
 - JUnit XML is not parsed on interpreters whose expat is older than 2.7.2 (CVE-2025-59375), and
   is capped at 1 MiB.
 - pytest summary lines with colour codes, `xfailed` and `xpassed` are read.
+- Configured secret patterns are matched against the bare path or command, so `^` and `$`
+  anchors work as written.
 - CI actions moved to checkout v7.0.1 and setup-python v7.1.0, pinned by commit SHA, with a
   read-only `contents` permission.
 
