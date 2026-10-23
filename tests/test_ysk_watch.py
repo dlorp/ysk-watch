@@ -166,13 +166,68 @@ def test_tripwire_is_kept_when_model_audit_is_off(ysk):
     assert out and "test_weakened" in out["message"]
 
 
-def test_same_finding_is_not_nudged_twice(ysk):
+def test_open_finding_holds_across_attempts_until_addressed(ysk):
+    """A reply alone does not clear a finding: it stays open, then stops after max_nudges.
+
+    The earlier contract ("same finding is not nudged twice") let any reply clear a block,
+    which is the loophole the audit named. The finding now survives an answer that does not
+    name it, and the nudge count (3 by default) still bounds the argument.
+    """
     _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "")
-    assert ysk._on_pre_verify(session_id="s1", final_response="ok", changed_paths=["t"]) is not None
+    first = ysk._on_pre_verify(
+        session_id="s1", final_response="ok", changed_paths=["tests/test_a.py"]
+    )
+    second = ysk._on_pre_verify(
+        session_id="s1",
+        final_response="this is intended",
+        changed_paths=["tests/test_a.py"],
+        attempt=1,
+    )
+    assert first and second
+    assert "test_weakened" in second["message"]
+    # max_nudges is 3: the fourth attempt records the finding but stops holding the turn.
+    for attempt in (2, 3):
+        ysk._on_pre_verify(
+            session_id="s1",
+            final_response="this is intended",
+            changed_paths=["tests/test_a.py"],
+            attempt=attempt,
+        )
     assert (
-        ysk._on_pre_verify(session_id="s1", final_response="ok", changed_paths=["t"], attempt=1)
+        ysk._on_pre_verify(
+            session_id="s1",
+            final_response="this is intended",
+            changed_paths=["tests/test_a.py"],
+            attempt=4,
+        )
         is None
     )
+
+
+def test_open_finding_is_cleared_when_the_answer_names_its_file(ysk):
+    _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "")
+    assert ysk._on_pre_verify(
+        session_id="s1", final_response="ok", changed_paths=["tests/test_a.py"]
+    )
+    cleared = ysk._on_pre_verify(
+        session_id="s1",
+        final_response="tests/test_a.py: the assertion moved into test_b with a tighter bound.",
+        changed_paths=["tests/test_a.py"],
+        attempt=1,
+    )
+    assert cleared is None
+
+
+def test_naming_the_rule_alone_does_not_clear_a_finding(ysk):
+    """A reply that lists rule names addresses nothing in particular."""
+    _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "")
+    assert ysk._on_pre_verify(session_id="s1", final_response="ok")
+    held = ysk._on_pre_verify(
+        session_id="s1",
+        final_response="Notes: test weakened, forge push guard, stale test evidence.",
+        attempt=1,
+    )
+    assert held and "test_weakened" in held["message"]
 
 
 def test_model_can_clear_a_benign_tripwire(ysk, monkeypatch):

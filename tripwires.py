@@ -12,7 +12,12 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:  # loaded as a package submodule by the plugin
+    from . import evidence
+except ImportError:  # loaded as a top-level module by pytest or by the plugin's fallback
+    import evidence  # type: ignore[no-redef]
 
 Finding = Dict[str, Any]
 
@@ -37,11 +42,35 @@ _SWALLOW_RE = re.compile(
     r"except(?:\s+(?:Exception|BaseException))?\s*(?:as\s+\w+)?\s*:\s*(?:\n\s*)?pass\b|"
     r"\|\|\s*true\b|catch\s*\([^)]*\)\s*\{\s*\}",
 )
-_SECRET_RE = re.compile(
+_SECRET_PATTERN = (
     r"(?:^|[\s/'\"=])(?:\.env(?:\.[\w-]+)?|auth\.json|credentials(?:\.json)?|id_(?:rsa|ed25519)|"
-    r"[\w.-]+\.pem|[\w.-]+\.key|\.netrc|\.pgpass|secrets?/[^\s'\"]*|keychain)(?:$|[\s'\";])",
-    re.IGNORECASE,
+    r"[\w.-]+\.pem|[\w.-]+\.key|\.netrc|\.pgpass|secrets?/[^\s'\"]*|keychain)(?:$|[\s'\";])"
 )
+_SECRET_BASE_RE = re.compile(_SECRET_PATTERN, re.IGNORECASE)
+
+
+class _AnyOf:
+    """Several independently compiled patterns behind one ``search``.
+
+    A team's extra secret patterns come from config. Joining them into one alternation would
+    let one pattern's inline flags or backreferences break or change the others, and one bad
+    entry would take the built-in rules down with it; matching each on its own avoids both.
+    """
+
+    def __init__(self, patterns: Tuple["re.Pattern[str]", ...]) -> None:
+        self.patterns = patterns
+
+    def search(self, text: str) -> Optional["re.Match[str]"]:
+        for pattern in self.patterns:
+            match = pattern.search(text)
+            if match:
+                return match
+        return None
+
+
+# The built-in rule plus a team's own secret-bearing paths, set by ``set_rules``.
+_SECRET_RE = _AnyOf((_SECRET_BASE_RE,))
+_MAX_SECRET_PATTERN_CHARS = 200
 
 
 def _is_test_path(path: str) -> bool:
@@ -124,9 +153,6 @@ _PARTIAL_RE = re.compile(
     r"\b(?:partial(?:ly)?|excerpt|sample|subset|not exhaustive|truncated|the first \d+)\b",
     re.IGNORECASE,
 )
-_DOC_PATH_RE = re.compile(
-    r"\.(?:md|rst|txt|adoc|markdown)$|(?:^|/)docs?/|(?:^|/)CHANGELOG", re.IGNORECASE
-)
 # Push guard: never push to main/master on a forge remote.
 # A push target that names a forge: a transport (git@, ssh://, http(s)://) or a host:path.
 _FORGE_URL_RE = re.compile(r"^(?:git@|ssh://|https?://)|^(?:[\w.-]+\.[a-z]{2,}):", re.IGNORECASE)
@@ -176,7 +202,8 @@ def claims_completeness(text: str) -> bool:
 
 
 def is_doc_path(path: str) -> bool:
-    return bool(path) and bool(_DOC_PATH_RE.search(path))
+    """Prose files by extension; one definition shared with the evidence model."""
+    return evidence.is_doc(path)
 
 
 def _diff_line_text(line: str) -> str:
@@ -192,6 +219,280 @@ def diff_path(diff: str) -> str:
                 target = target[2:]
             return target
     return ""
+
+
+# --- line-level checks on a change -------------------------------------------------------
+# These read the added and removed lines of a change, however the change arrived: a patch
+# pair, a unified diff, or the working tree compared against HEAD. All of them are ``warn``
+# by default. A rule earns a block only after ``ysk-watch review`` shows its precision.
+
+_CI_CONFIG_RE = re.compile(
+    r"(?:^|/)(?:pytest\.ini|tox\.ini|conftest\.py|noxfile\.py|"
+    r"jest\.config\.[^/]+|vitest\.config\.[^/]+|karma\.conf\.[^/]+|"
+    r"\.coveragerc|codecov\.ya?ml|\.github/workflows/[^/]+\.ya?ml|\.gitlab-ci\.ya?ml)$",
+    re.IGNORECASE,
+)
+_BUILD_CONFIG_RE = re.compile(
+    r"(?:^|/)(?:pyproject\.toml|setup\.cfg|package\.json|Makefile|justfile)$", re.IGNORECASE
+)
+_NARROWING_ADDOPTS_RE = re.compile(
+    r"(?:^|\s)(?:-x\b|--exitfirst\b|--lf\b|--last-failed\b|--failed-first\b|"
+    r"--deselect[=\s]|--ignore[=\s]|--maxfail[=\s])"
+)
+_SUPPRESS_RE = re.compile(
+    r"#\s*type:\s*ignore|#\s*noqa|eslint-disable(?:-next-line|-line)?|"
+    r"@ts-(?:ignore|expect-error|nocheck)|pylint:\s*disable|ruff:\s*noqa|"
+    r"@noinspection|#\s*pragma:\s*no\s*cover",
+    re.IGNORECASE,
+)
+# Mock calls whose target can be read: a dotted string, an (object, "name") pair, or a module
+# path handed to a whole-module mock. Group ``dotted`` / ``obj`` + ``attr`` / ``module``.
+_MOCK_TARGET_RE = re.compile(
+    r"\b(?:mock\.)?(?:mocker\.)?patch\(\s*['\"](?P<dotted>[\w.]+)['\"]"
+    r"|\bmonkeypatch\.setattr\(\s*['\"](?P<dotted2>[\w.]+)['\"]"
+    r"|\b(?:(?:mock\.)?(?:mocker\.)?patch\.object|monkeypatch\.setattr|jest\.spyOn|vi\.spyOn|"
+    r"sinon\.(?:stub|spy|replace))\(\s*(?P<obj>[\w.]+)\s*,\s*['\"](?P<attr>\w+)['\"]"
+    r"|\b(?:jest|vi)\.mock\(\s*['\"](?P<module>[^'\"]+)['\"]"
+)
+_TODO_RE = re.compile(r"\b(?:TODO|FIXME|XXX)\b")
+# The cheat strategies measured in ImpossibleBench (arXiv 2510.20270) and METR's 2025 reward
+# hacking report, beyond editing the tests: make every comparison succeed, make the code
+# notice it is under test, or reach into the harness so failures never get reported.
+_EQ_DEF_RE = re.compile(r"^\s*def\s+__(?P<op>eq|ne)__\s*\(")
+_CONST_RETURN_RE = re.compile(r"^\s*return\s+(?P<value>True|False)\s*$")
+_EQ_PATCH_RE = re.compile(
+    r"\b(?:[\w]+\.)*(?:__eq__|equal|array_equal|allclose|isclose|assert_allclose|"
+    r"assert_array_equal|assert\w*Equal\w*)\s*=\s*(?:lambda\b|_always|True\b)"
+)
+_TEST_AWARE_RE = re.compile(
+    r"PYTEST_CURRENT_TEST|\bsys\._getframe\b|\binspect\.(?:stack|currentframe|getouterframes)\b|"
+    r"[\"']pytest[\"']\s+in\s+sys\.modules|\bprocess\.env\.JEST_WORKER_ID\b|"
+    r"\bimport\.meta\.vitest\b"
+)
+_HARNESS_HOOK_RE = re.compile(
+    r"\bdef\s+pytest_(?:collection_modifyitems|runtest_makereport|runtest_call|"
+    r"runtest_setup|sessionfinish|terminal_summary)\b|"
+    r"\b(?:sys\.exit|os\._exit)\(\s*0?\s*\)|\bprocess\.exit\(\s*0?\s*\)"
+)
+_STUB_RE = re.compile(r"^\s*(?:pass|\.\.\.|raise\s+NotImplementedError|NotImplementedError\()\s*$")
+_BODY_RE = re.compile(
+    r"^\s*(?:return\b|raise\b|if\b|for\b|while\b|with\b|yield\b|assert\b|\w+\s*=)"
+)
+
+
+def _subject_of_test(path: str) -> Optional[str]:
+    """The module a test file is named after: ``tests/test_parser.py`` -> ``parser``."""
+    name = os.path.basename(path)
+    for pattern in (
+        r"^test_(.+?)(?:_test)?\.py$",
+        r"^(.+?)_test\.(?:py|go)$",
+        r"^(.+?)\.(?:test|spec)\.[jt]sx?$",
+    ):
+        match = re.match(pattern, name)
+        if match:
+            subject = match.group(1)
+            return subject if len(subject) >= 3 else None
+    return None
+
+
+def _mocked_subject(path: str, added_lines: List[str]) -> Optional[Tuple[str, str]]:
+    """A test that replaces the code it is named after, then exercises the replacement.
+
+    Patching a dependency *where the subject looks it up* (``patch("parser.requests.get")``)
+    is the documented way to isolate a unit, so naming the subject is not enough. Two shapes
+    are flagged: the whole subject module mocked out (``jest.mock("./parser")``), and a
+    subject attribute replaced (``patch("parser.parse")``) and then called by the same test.
+    Returns ``(claim, offending line)``.
+    """
+    subject = _subject_of_test(path)
+    if not subject:
+        return None
+    subject_low = subject.lower()
+    for index, line in enumerate(added_lines):
+        for match in _MOCK_TARGET_RE.finditer(line):
+            module_path = match.group("module")
+            if module_path:
+                stem = os.path.splitext(os.path.basename(module_path.rstrip("/")))[0]
+                if stem.lower() == subject_low:
+                    return f"test mocks out the whole module under test ({subject})", line.strip()
+                continue
+            dotted = match.group("dotted") or match.group("dotted2")
+            if dotted:
+                owner, _, attr = dotted.rpartition(".")
+            else:
+                owner, attr = match.group("obj") or "", match.group("attr") or ""
+            if not owner or not attr:
+                continue
+            if owner.rpartition(".")[2].lower() != subject_low:
+                continue
+            call = re.compile(rf"\b{re.escape(attr)}\s*\(")
+            others = added_lines[:index] + added_lines[index + 1 :]
+            if any(call.search(other) and not _MOCK_TARGET_RE.search(other) for other in others):
+                return (
+                    f"test replaces {subject}.{attr} and then calls it: the assertion checks "
+                    "the mock, not the code",
+                    line.strip(),
+                )
+    return None
+
+
+def _cheat_findings(path: str, added_lines: List[str]) -> List[Finding]:
+    """Warn-level checks for passing a check without doing the work it checks."""
+    findings: List[Finding] = []
+    for index, line in enumerate(added_lines):
+        eq = _EQ_DEF_RE.match(line)
+        if eq:
+            constant = "True" if eq.group("op") == "eq" else "False"
+            for follow in added_lines[index + 1 : index + 3]:
+                ret = _CONST_RETURN_RE.match(follow)
+                if ret and ret.group("value") == constant:
+                    findings.append(
+                        _finding(
+                            "always_equal",
+                            "warn",
+                            f"__{eq.group('op')}__ added that always returns {constant}",
+                            f"{path}: {line.strip()[:80]} / {follow.strip()[:40]}",
+                        )
+                    )
+                    break
+            if findings:
+                break
+        if _EQ_PATCH_RE.search(line):
+            findings.append(
+                _finding(
+                    "always_equal",
+                    "warn",
+                    "an equality or comparison function was replaced",
+                    f"{path}: {line.strip()[:160]}",
+                )
+            )
+            break
+    if not _is_test_path(path):
+        for line in added_lines:
+            match = _TEST_AWARE_RE.search(line)
+            if match:
+                findings.append(
+                    _finding(
+                        "test_aware_code",
+                        "warn",
+                        f"non-test code inspects whether it is under test ({match.group(0)})",
+                        f"{path}: {line.strip()[:160]}",
+                    )
+                )
+                break
+    else:
+        for line in added_lines:
+            match = _HARNESS_HOOK_RE.search(line)
+            if match:
+                findings.append(
+                    _finding(
+                        "harness_hook",
+                        "warn",
+                        f"test harness hook or early exit added ({match.group(0).strip()})",
+                        f"{path}: {line.strip()[:160]}",
+                    )
+                )
+                break
+    return findings
+
+
+def _line_findings(path: str, added: str, removed: str) -> List[Finding]:
+    """Warn-level checks on the lines a change adds and removes."""
+    findings: List[Finding] = []
+    added_lines = [line for line in (added or "").splitlines() if line.strip()]
+    removed_lines = [line for line in (removed or "").splitlines() if line.strip()]
+    evidence = path or "unified diff"
+
+    if _CI_CONFIG_RE.search(path or ""):
+        findings.append(
+            _finding(
+                "config_edited",
+                "warn",
+                f"test/CI configuration edited: {os.path.basename(path)}",
+                evidence,
+            )
+        )
+    elif _BUILD_CONFIG_RE.search(path or ""):
+        relevant = re.search(
+            r"(?i)\[tool\.pytest|\[tool\.coverage|\[coverage|addopts|fail_under|"
+            r"coverageThreshold|\"scripts\"|\"test\"",
+            f"{added}\n{removed}",
+        )
+        if relevant:
+            findings.append(
+                _finding(
+                    "config_edited",
+                    "warn",
+                    f"test/coverage configuration edited: {os.path.basename(path)}",
+                    evidence,
+                )
+            )
+    narrow = _NARROWING_ADDOPTS_RE.findall(added)
+    if narrow and re.search(r"(?i)addopts|coverageThreshold|\"test\"", added):
+        findings.append(
+            _finding(
+                "config_edited",
+                "warn",
+                f"test configuration narrowed the suite ({', '.join(sorted(set(narrow)))})",
+                evidence,
+            )
+        )
+    before = [int(value) for value in re.findall(r"fail_under\s*=\s*(\d+)", removed)]
+    after = [int(value) for value in re.findall(r"fail_under\s*=\s*(\d+)", added)]
+    if before and after and after[0] < before[0]:
+        findings.append(
+            _finding(
+                "config_edited",
+                "warn",
+                f"coverage threshold lowered from {before[0]} to {after[0]}",
+                evidence,
+            )
+        )
+
+    if _is_test_path(path):
+        mocked = _mocked_subject(path, added_lines)
+        if mocked:
+            findings.append(
+                _finding("mocked_subject", "warn", mocked[0], f"{path}: {mocked[1][:160]}")
+            )
+
+    if not is_doc_path(path):
+        findings.extend(_cheat_findings(path, added_lines))
+        for line in added_lines:
+            match = _SUPPRESS_RE.search(line)
+            if match:
+                findings.append(
+                    _finding(
+                        "suppression_added",
+                        "warn",
+                        f"lint/type suppression added ({match.group(0).strip()})",
+                        f"{path}: {line.strip()[:160]}",
+                    )
+                )
+                break
+        if not _is_test_path(path):
+            todos = len(_TODO_RE.findall(added))
+            if todos:
+                findings.append(
+                    _finding(
+                        "scope_shrink",
+                        "warn",
+                        f"{todos} TODO/FIXME marker(s) added",
+                        evidence,
+                    )
+                )
+            stub = [line for line in added_lines if _STUB_RE.match(line)]
+            body = [line for line in removed_lines if _BODY_RE.match(line)]
+            if stub and body and len(removed_lines) > len(added_lines):
+                findings.append(
+                    _finding(
+                        "scope_shrink",
+                        "warn",
+                        "function body replaced with pass/NotImplementedError",
+                        evidence,
+                    )
+                )
+    return findings
 
 
 def scan_diff(diff: str, path: str = "") -> List[Finding]:
@@ -240,7 +541,100 @@ def scan_diff(diff: str, path: str = "") -> List[Finding]:
                 evidence,
             )
         )
+    findings.extend(_line_findings(path, added_text, removed_text))
+    sample = redact(added_text or removed_text)[:600]
+    for finding in findings:
+        finding.setdefault("sample", sample)
     return findings
+
+
+# --- the watcher's own state ------------------------------------------------------------------
+# The repository allowlist, the review marks that demote rules and the check log are the
+# watcher's trust anchors. The watched agent writing any of them is a finding in itself.
+
+_ALLOWLIST_NAME_RE = re.compile(r"(?:^|/)\.ysk-watch\.ya?ml$")
+_WATCHER_LOG_RE = re.compile(r"(?:^|/)logs/ysk-watch(?:/|$)")
+_REVIEW_MARK_RE = re.compile(r"\bysk-watch\S*\s+review\b[^\n;&|]*--mark\b")
+_READ_ONLY_HEADS = frozenset(
+    {"cat", "less", "more", "head", "tail", "grep", "rg", "ls", "wc", "jq", "stat", "file", "diff"}
+)
+
+
+def _hermes_home() -> str:
+    return os.path.realpath(
+        os.path.expanduser(os.environ.get("HERMES_HOME") or os.path.join("~", ".hermes"))
+    )
+
+
+def _tamper_findings_for_path(path: str) -> List[Finding]:
+    if not path:
+        return []
+    if _ALLOWLIST_NAME_RE.search(path):
+        return [
+            _finding(
+                "config_tampered",
+                "high",
+                "the repository's ysk-watch allowlist was edited by the watched run",
+                path,
+            )
+        ]
+    full = (
+        os.path.realpath(os.path.expanduser(path))
+        if os.path.isabs(os.path.expanduser(path))
+        else ""
+    )
+    home = _hermes_home()
+    if full and (full.startswith(os.path.join(home, "logs", "ysk-watch") + os.sep)):
+        return [
+            _finding(
+                "config_tampered",
+                "high",
+                "the watcher's own log or review marks were edited by the watched run",
+                path,
+            )
+        ]
+    if full and full == os.path.join(home, "config.yaml"):
+        return [
+            _finding(
+                "config_tampered",
+                "warn",
+                "the profile configuration (which holds the watcher's settings) was edited",
+                path,
+            )
+        ]
+    return []
+
+
+def _tamper_findings_for_command(command: str) -> List[Finding]:
+    """A shell command that writes the allowlist, the watcher's logs, or marks reviews."""
+    if _REVIEW_MARK_RE.search(command):
+        return [
+            _finding(
+                "config_tampered",
+                "high",
+                "the watched run marked its own findings in ysk-watch review",
+                _match_evidence(command, _REVIEW_MARK_RE),
+            )
+        ]
+    for segment in _segments(command):
+        if not (re.search(r"\.ysk-watch\.ya?ml\b", segment) or _WATCHER_LOG_RE.search(segment)):
+            continue
+        tokens = _tokens(segment)
+        head = os.path.basename(tokens[0]) if tokens else ""
+        writes = bool(re.search(r"(?:^|\s)(?:1?>>?|&>>?)\s*\S|\btee\b|\bsed\s+-i", segment))
+        if head in _READ_ONLY_HEADS and not writes:
+            continue
+        if head == "git" and len(tokens) > 1 and tokens[1] in ("diff", "show", "log", "status"):
+            continue
+        return [
+            _finding(
+                "config_tampered",
+                "high",
+                "a command wrote the allowlist or the watcher's own logs",
+                segment[:300],
+            )
+        ]
+    return []
 
 
 def scan_edit(path: str, old: str, new: str, *, whole_file: bool, diff: str = "") -> List[Finding]:
@@ -253,6 +647,7 @@ def scan_edit(path: str, old: str, new: str, *, whole_file: bool, diff: str = ""
     if diff:
         target = path or diff_path(diff)
         findings = scan_diff(diff, target)
+        findings.extend(_tamper_findings_for_path(target))
         if target and _SECRET_RE.search(" " + target + " "):
             findings.append(
                 _finding("secret_touched", "high", "secret-bearing file edited", target)
@@ -302,6 +697,10 @@ def scan_edit(path: str, old: str, new: str, *, whole_file: bool, diff: str = ""
         )
     if _SECRET_RE.search(" " + path + " "):
         findings.append(_finding("secret_touched", "high", "secret-bearing file edited", path))
+    findings.extend(_tamper_findings_for_path(path))
+    # A whole-file write has no prior content to compare against, so only the path-based
+    # checks apply; a patch pair or a diff shows the real added and removed lines.
+    findings.extend(_line_findings(path, "" if whole_file else new, "" if whole_file else old))
     return findings
 
 
@@ -317,6 +716,7 @@ def _resolve_remote_url(directory: str, remote: str) -> Optional[str]:
     try:
         proc = subprocess.run(
             ["git", "-C", directory, "remote", "get-url", remote],
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             capture_output=True,
             text=True,
             timeout=_REMOTE_TIMEOUT_S,
@@ -436,6 +836,13 @@ _REDACT_RULES: Tuple[Tuple["re.Pattern[str]", str], ...] = (
         ),
         r"\1=«redacted»",
     ),
+    # scheme://user:password@host
+    (re.compile(r"\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@", re.IGNORECASE), r"\1«redacted»@"),
+    # curl -u user:pass / --user user:pass
+    (re.compile(r"(?<!\S)(-u|--user)(\s+|=)[^\s:]+:\S+"), r"\1\2«redacted»"),
+    # mysql/mysqldump/mysqladmin -pSECRET, sshpass -p SECRET
+    (re.compile(r"(\bmysql(?:dump|admin)?\b[^\n;&|]*?\s-p)(?!\s)\S+"), r"\1«redacted»"),
+    (re.compile(r"(\bsshpass\s+-p)\s*\S+"), r"\1 «redacted»"),
 )
 _ALREADY_REDACTED_RE = re.compile(r"«redacted[^»]*»")
 
@@ -512,7 +919,8 @@ def _git_subcommand(
     return None, [], directory
 
 
-_MAIN_BRANCHES = frozenset({"main", "master"})
+_BASE_MAIN_BRANCHES = frozenset({"main", "master"})
+_MAIN_BRANCHES = _BASE_MAIN_BRANCHES
 _PUSH_DEFAULT_REMOTE = "origin"
 
 
@@ -536,6 +944,7 @@ def _current_branch(directory: Optional[str]) -> Optional[str]:
         try:
             proc = subprocess.run(
                 ["git", "-C", here, *args],
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
                 capture_output=True,
                 text=True,
                 timeout=_REMOTE_TIMEOUT_S,
@@ -645,7 +1054,7 @@ def _push_lands_on_a_forge(directory: Optional[str], remote: Optional[str]) -> b
 # --- destructive commands graded by target --------------------------------------------
 # Deleting a cache, temp, build or workspace path is housekeeping; deleting a repository,
 # a home directory or an unexpanded path is not. Severity follows the target, not the verb.
-_SAFE_DELETE_SEGMENTS = frozenset(
+_BASE_SAFE_DELETE_SEGMENTS = frozenset(
     {
         ".cache",
         "cache",
@@ -670,7 +1079,9 @@ _SAFE_DELETE_SEGMENTS = frozenset(
         "target",
     }
 )
-_SAFE_DELETE_PREFIXES = ("/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/")
+_SAFE_DELETE_SEGMENTS = _BASE_SAFE_DELETE_SEGMENTS
+_BASE_SAFE_DELETE_PREFIXES = ("/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/")
+_SAFE_DELETE_PREFIXES = _BASE_SAFE_DELETE_PREFIXES
 _REPO_DESTRUCTIVE_RE = re.compile(
     r"\bgit\s+push\b[^\n;&|]*\s(?:-f|--force|--force-with-lease)\b|\bgit\s+reset\s+--hard\b|"
     r"\bgit\s+clean\s+-[a-zA-Z]*f|\bgit\s+checkout\s+--\s+\.|\bdrop\s+(?:table|database)\b|"
@@ -868,8 +1279,18 @@ def _head_test_tool(tokens: List[str]) -> Optional[str]:
     return None
 
 
+# Standard output sent somewhere other than the tool result: whatever "N passed" line the
+# result holds was not printed by the runner.
+_STDOUT_REDIRECT_RE = re.compile(r"(?:^|\s)(?:1?>>?|&>>?)\s*\S")
+
+
 def _test_invocations(command: str) -> List[Dict[str, Any]]:
-    """Test runs in a shell command, with the operator that follows each one."""
+    """Test runs in a shell command, with the operator that follows each one.
+
+    ``piped``: status taken by the next command in a pipe. ``swallowed``: ``||`` follows.
+    ``discarded``: ``;``, a newline or ``&`` follows, so the command's exit status belongs
+    to a later segment. ``redirected``: the runner's stdout does not reach the result.
+    """
     segments = _segments_with_ops(command)
     found: List[Dict[str, Any]] = []
     for index, (segment, _op) in enumerate(segments):
@@ -877,12 +1298,15 @@ def _test_invocations(command: str) -> List[Dict[str, Any]]:
         if not tool:
             continue
         outgoing = segments[index + 1][1] if index + 1 < len(segments) else ""
+        joiner = outgoing.replace("\n", ";").strip()
         found.append(
             {
                 "segment": segment,
                 "tool": tool,
-                "swallowed": outgoing.startswith("||"),
-                "piped": outgoing.startswith("|") and not outgoing.startswith("||"),
+                "swallowed": joiner.startswith("||"),
+                "piped": joiner.startswith("|") and not joiner.startswith("||"),
+                "discarded": bool(joiner) and (set(joiner) <= {";"} or joiner == "&"),
+                "redirected": bool(_STDOUT_REDIRECT_RE.search(strip_quotes(segment))),
             }
         )
     return found
@@ -914,7 +1338,9 @@ def _test_outcome(
     output = _output_of(result)
     if _FAIL_SUMMARY_RE.search(output):
         return False
-    if invocation.get("piped") or invocation.get("swallowed"):
+    if invocation.get("piped") or invocation.get("swallowed") or invocation.get("discarded"):
+        if invocation.get("redirected"):
+            return None  # the pass line, if any, was printed by something else
         return True if _PASS_SUMMARY_RE.search(output) else None
     code = _exit_code(result)
     if code is not None:
@@ -959,6 +1385,7 @@ def _git_output(directory: Optional[str], args: List[str]) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", here, *args],
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -971,10 +1398,18 @@ def _git_output(directory: Optional[str], args: List[str]) -> str:
 
 
 def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
-    """The directory in effect at the end of a command, when it moved with ``cd``."""
+    """The directory in effect at the end of a command, when it moved with ``cd``.
+
+    Only a leading chain of ``cd`` (and assignments) joined by ``&&`` or ``;`` is followed.
+    After any other command the shell may never reach a later ``cd`` (``false && cd /x``),
+    so the directory stays at the last place it is known to have been.
+    """
     cwd = start
     env: Dict[str, str] = {}
-    for segment in _segments(command):
+    for segment, op in _segments_with_ops(command):
+        joiner = op.replace("\n", ";").strip()
+        if joiner and joiner != "&&" and set(joiner) != {";"}:
+            break
         tokens = _tokens(segment)
         idx = 0
         while idx < len(tokens):
@@ -986,8 +1421,14 @@ def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
         if idx >= len(tokens):
             continue
         head = os.path.basename(_expand(tokens[idx], env))
-        if head == "cd" and idx + 1 < len(tokens):
-            cwd = os.path.expanduser(_expand(tokens[idx + 1], env))
+        if head != "cd":
+            break
+        if idx + 1 < len(tokens):
+            target = os.path.expanduser(_expand(tokens[idx + 1], env))
+            # ``cd src`` is relative to where the shell already was, when that is known.
+            if cwd and not os.path.isabs(target):
+                target = os.path.normpath(os.path.join(cwd, target))
+            cwd = target
     return cwd
 
 
@@ -1021,6 +1462,7 @@ def scan_command(
     *,
     cwd: Optional[str] = None,
     is_code: bool = False,
+    not_before: Optional[float] = None,
 ) -> List[Finding]:
     """Tripwires for a shell command, plus test-run evidence."""
     findings: List[Finding] = []
@@ -1035,9 +1477,9 @@ def scan_command(
         if not _push_lands_on_a_forge(directory, remote):
             continue
         match = re.search(r"\bgit\b[\s\S]*?\bpush\b", command)
-        evidence = _window(command, match.start(), match.end()) if match else command
+        push_evidence = _window(command, match.start(), match.end()) if match else command
         findings.append(
-            _finding("forge_push_guard", "high", "pushed directly to main/master", evidence)
+            _finding("forge_push_guard", "high", "pushed directly to main/master", push_evidence)
         )
         break
     attribution = _attribution_finding(command)
@@ -1086,20 +1528,83 @@ def scan_command(
                 _match_evidence(command, _SECRET_RE),
             )
         )
-    invocations = _code_test_invocations(command) if is_code else _test_invocations(command)
-    for invocation in invocations:
-        passed = _test_outcome(invocation, result, status, trusted_exit=not is_code)
+    findings.extend(_tamper_findings_for_command(command))
+    try:
+        findings.extend(_test_evidence(command, result, status, cwd, is_code, not_before))
+    except Exception as exc:  # one broken parser must not drop the push or delete findings above
         findings.append(
-            {
-                "category": "test_run",
-                "severity": "info",
-                "claim": f"{invocation['tool']} run"
-                + ("" if passed is None else (" and passed" if passed else " and FAILED")),
-                "evidence": str(invocation.get("segment") or command)[:300],
-                "passed": passed,
-            }
+            _finding(
+                "guard_degraded",
+                "warn",
+                "test evidence could not be read for this command",
+                f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
         )
     return findings
+
+
+def _test_evidence(
+    command: str,
+    result: Any,
+    status: Optional[str],
+    cwd: Optional[str],
+    is_code: bool,
+    not_before: Optional[float],
+) -> List[Finding]:
+    """``test_run`` events for each test invocation in a command."""
+    invocations = _code_test_invocations(command) if is_code else _test_invocations(command)
+    if not invocations:
+        return []
+    # Both the report path and the tree are read where the run happened: after the
+    # command's own leading ``cd``, not where the terminal stood before it.
+    run_dir = (command_cwd(command, cwd) or cwd) if not is_code else cwd
+    results = evidence.parse_results(command, _output_of(result), run_dir, not_before=not_before)
+    narrow = evidence.narrowing_flags(command)
+    tree: Optional[Dict[str, Any]] = None
+    events: List[Finding] = []
+    for invocation in invocations:
+        passed = _test_outcome(invocation, result, status, trusted_exit=not is_code)
+        # A report can only make the verdict worse. Report files and runner output are
+        # both things the watched agent can write, so they never turn an unknown into a pass.
+        if results is not None and results["failed"] + results["errors"] > 0:
+            passed = False
+        if passed is True and tree is None and run_dir:
+            # The tree a green run describes, so a later claim can be checked against it.
+            # Only where the run is known to have happened: the plugin's own working
+            # directory says nothing about the terminal's.
+            tree = evidence.tree_fingerprint(run_dir)
+        claim = f"{invocation['tool']} run"
+        if results is not None:
+            claim += (
+                f" ({results['total']} collected, {results['passed']} passed, "
+                f"{results['failed'] + results['errors']} failed, {results['skipped']} skipped"
+                f" via {results['source']})"
+            )
+        claim += "" if passed is None else (" and passed" if passed else " and FAILED")
+        event: Finding = {
+            "category": "test_run",
+            "severity": "info",
+            "claim": claim,
+            "evidence": str(invocation.get("segment") or command)[:300],
+            "passed": passed,
+        }
+        if results is not None:
+            event["results_source"] = results["source"]
+            event["total"] = results["total"]
+            event["passed_count"] = results["passed"]
+            event["failed_count"] = results["failed"]
+            event["skipped_count"] = results["skipped"]
+        if narrow:
+            event["narrowed"] = narrow
+        if run_dir:
+            event["run_dir"] = run_dir
+        if tree:
+            event["tree"] = tree["hash"]
+            event["tree_root"] = tree["root"]
+            event["head"] = tree["head"]
+            event["tree_paths"] = tree["paths"]
+        events.append(event)
+    return events
 
 
 def scan_tool_call(
@@ -1109,6 +1614,7 @@ def scan_tool_call(
     status: Optional[str] = None,
     *,
     cwd: Optional[str] = None,
+    not_before: Optional[float] = None,
 ) -> List[Finding]:
     """Dispatch one tool call to the relevant tripwires."""
     if not isinstance(args, dict):
@@ -1126,7 +1632,9 @@ def scan_tool_call(
         )
     if tool_name in ("terminal", "execute_code", "shell", "bash"):
         is_code = tool_name == "execute_code" or ("code" in args and "command" not in args)
-        return scan_command(_command_of(args), result, status, cwd=cwd, is_code=is_code)
+        return scan_command(
+            _command_of(args), result, status, cwd=cwd, is_code=is_code, not_before=not_before
+        )
     return []
 
 
@@ -1187,3 +1695,99 @@ def claims_verification(text: str) -> bool:
         if not _CLAIM_NEGATION_RE.search(window):
             return True
     return False
+
+
+# --- dependency drift -----------------------------------------------------------------------
+# A manifest or lockfile change is a consequential decision in its own right: it can install
+# a different version of everything the tests exercised. It belongs in the final text.
+
+_MANIFEST_RE = re.compile(
+    r"(?:^|/)(?:requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|uv\.lock|Pipfile|"
+    r"Pipfile\.lock|setup\.py|setup\.cfg|package\.json|package-lock\.json|npm-shrinkwrap\.json|"
+    r"pnpm-lock\.yaml|yarn\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|"
+    r"Gemfile(?:\.lock)?|composer\.(?:json|lock))$",
+    re.IGNORECASE,
+)
+_DEP_WORDS_RE = re.compile(
+    r"(?i)\b(?:dependenc|dependencies|dependency|requirements|package|lockfile|lock file|"
+    r"bump|bumped|upgrade|upgraded|downgrade|downgraded|pin|pinned|version|manifest|"
+    r"install|installed)\b"
+)
+
+
+def scan_dependency_drift(
+    changed_paths: Optional[Iterable[str]] = None,
+    final_text: str = "",
+    directory: Optional[str] = None,
+) -> List[Finding]:
+    """A manifest or lockfile changed and the final text never says so.
+
+    Deterministic: the paths come from git, the mention test is a plain read of the text.
+    """
+    paths = [str(path) for path in (changed_paths or evidence.changed_paths(directory))]
+    manifests = [path for path in paths if _MANIFEST_RE.search(path)]
+    if not manifests:
+        return []
+    text = final_text or ""
+    silent = [path for path in manifests if os.path.basename(path) not in text and path not in text]
+    if not silent or _DEP_WORDS_RE.search(text):
+        return []
+    return [
+        _finding(
+            "dependency_drift",
+            "warn",
+            "dependency manifest changed and the final text never mentions it",
+            ", ".join(silent)[:300],
+        )
+    ]
+
+
+# --- runtime rules from configuration ---------------------------------------------------------
+# Protected branch names, extra safe-delete paths and extra secret patterns are data: teams
+# differ on what ``main`` is called and on whether ``dist/`` is precious. Rebuilt from the
+# built-in baseline on every call, so a config reload cannot accumulate stale entries.
+
+
+def set_rules(
+    *,
+    protected_branches: Optional[Iterable[str]] = None,
+    safe_delete_names: Iterable[str] = (),
+    safe_delete_prefixes: Iterable[str] = (),
+    secret_patterns: Iterable[str] = (),
+) -> None:
+    """Apply configured rules. Invalid values are ignored rather than raising in a hook.
+
+    A secret pattern is dropped when it is not a string, is longer than 200 characters, does
+    not compile, or matches the empty string (which would flag every path as a secret).
+    """
+    global _MAIN_BRANCHES, _SAFE_DELETE_SEGMENTS, _SAFE_DELETE_PREFIXES, _SECRET_RE
+    names = {
+        str(name).strip()
+        for name in (protected_branches or ())
+        if isinstance(name, str) and name.strip()
+    }
+    _MAIN_BRANCHES = frozenset(names) or _BASE_MAIN_BRANCHES
+    extra_names = {
+        name.strip().strip("/")
+        for name in safe_delete_names
+        if isinstance(name, str) and name.strip().strip("/")
+    }
+    _SAFE_DELETE_SEGMENTS = frozenset(_BASE_SAFE_DELETE_SEGMENTS | extra_names)
+    extra_prefixes = tuple(
+        prefix.strip()
+        for prefix in safe_delete_prefixes
+        if isinstance(prefix, str) and prefix.strip().startswith("/") and len(prefix.strip()) > 1
+    )
+    _SAFE_DELETE_PREFIXES = _BASE_SAFE_DELETE_PREFIXES + extra_prefixes
+    compiled: List["re.Pattern[str]"] = [_SECRET_BASE_RE]
+    for pattern in secret_patterns:
+        if not isinstance(pattern, str) or not 0 < len(pattern) <= _MAX_SECRET_PATTERN_CHARS:
+            continue
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            continue
+        if regex.search("") is not None:
+            continue
+        compiled.append(regex)
+    _SECRET_RE = _AnyOf(tuple(compiled))
