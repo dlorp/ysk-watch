@@ -4,9 +4,14 @@
 [![Tests](https://github.com/dlorp/ysk-watch/actions/workflows/tests.yml/badge.svg)](https://github.com/dlorp/ysk-watch/actions/workflows/tests.yml)
 [![Hermes](https://img.shields.io/badge/hermes-0.21.5%2B-informational)]()
 
-An integrity watcher for autonomous agents. It catches the shortcuts an agent takes to make a run
-look finished: assertions dropped from a test file, a skip marker slipped in, "all tests pass" with
-no passing run behind it, a destructive command, a secret-bearing path read or edited.
+An integrity watcher for agents. It catches the shortcuts an agent takes to make a run look
+finished: assertions dropped from a test file, a skip marker slipped in, "all tests pass" with no
+passing run behind it, monitoring switched off, a destructive command, a secret-bearing path read
+or edited.
+
+It is built for two settings: an orchestrator agent and the subagents it delegates to, where no
+human watches each step; and a human working with an agent, where the agent's final answer is what
+the human acts on. In both, the watcher checks what the agent says against what it did.
 
 Deterministic checks run on every tool call and cost nothing. A model is called only to confirm or
 clear a high-severity hit, so the judgement that needs context stays rare and the facts that need
@@ -21,10 +26,22 @@ is deliberately quiet: interesting is not important, so it says nothing unless s
 money, time, wasted work or a wrong result.
 
 ysk-watch is our interpretation of that idea for a different job. The instinct is the same, a
-watcher with a high bar that speaks only when it matters. The target is not a human reading a
-prompt, it is an unattended run whose only report is the one it writes at the end. Theirs advises
-the human in the loop. Ours checks the agent when the loop is unattended, where "the suite is
-green" can be a claim rather than a record.
+watcher with a high bar that speaks only when it matters. Theirs advises the human. Ours checks
+the agent: an orchestrator and its subagents, whose only report is the one they write at the end,
+and an agent working with a human, whose summary the human may take on trust. In both, "the suite
+is green" can be a claim rather than a record.
+
+A finding reaches whichever agent is about to report, orchestrator or subagent:
+
+- **Held.** When the agent edited files this turn, Hermes runs `pre_verify` and the finding holds
+  the turn until it is resolved, cited or admitted.
+- **Annotated.** Hermes runs `pre_verify` only after file-tool edits. When the turn could not be
+  held (an orchestrator that only delegated, shell-only work, a pass claimed in conversation, or
+  the host's own nudge budget ran out), the unresolved findings are appended to the answer before
+  it is delivered, so the human or the parent agent reading it sees them.
+- **Handed up.** When a delegated child stops, anything it left unresolved becomes a
+  `subagent_unresolved` finding in the parent's ledger. That holds the parent's turn, or reaches
+  the parent's answer, until the parent cites it.
 
 What that changes in practice:
 
@@ -131,7 +148,13 @@ never clear them.
 - **Per repository.** Every repository the session works in is tracked. Each one a green run
   covered must still have the tree that run saw; each one no green run covered must still have
   the tree it had when the session first went there. Tests run in a clean clone do not cover
-  edits in the real checkout. Outside git, the hook-visible edit timeline is the fallback.
+  edits in the real checkout.
+- **Outside git.** A directory that is not a repository is named by the size and modification
+  time of its source-like files (code, config and lock files; caches, virtualenvs, build output
+  and prose skipped). A shell edit after a green run still makes the evidence stale. A directory
+  with more than 5,000 such files, or that takes over a second to walk, gets no name, and the
+  edit timeline (edits the hooks saw) is the fallback. Without git installed at all, the same
+  directory rule applies everywhere.
 - **The runner's own report.** A `--junitxml` file, a `--json-report-file`, `go test -json`
   events, jest `--json` or vitest `--reporter=json` output (or its `--outputFile`) are read
   for counts. Reports and output are things the
@@ -169,10 +192,13 @@ Session patterns are counted per session and reported once when they cross a thr
 |---|---|---|
 | `post_tool_call` | Runs the tripwires for the call and appends findings to a bounded per-profile, per-session ledger. | Free, no model call |
 | `pre_verify` | Runs when an edited turn is about to finish. If the check itself fails, the turn is held once with a request to say what verifies the work, and the failure is logged as `guard_degraded`. Flags a "tests pass" claim with no passing run behind it, and runs **one** audit by the auxiliary model only if a high-severity tripwire fired. A confirmed finding returns `continue`. A claim closes only when the state stops supporting it (a green run on the current tree). A factual tripwire closes when the answer cites its finding id. Any other finding closes on its id, a path from its evidence, or a specific explanation the model accepts with enough confidence. A rule name alone, or "this is intended", clears nothing. After 3 nudges a finding stops holding the turn and is recorded as `justify_unresolved`. An answer that says the work cannot be finished honestly, and does not also claim a pass, releases the turn and is recorded as `self_reported_incomplete`. In report-only mode nothing is held; what would have been held is logged as `would_block`. | At most `thresholds.max_aux_calls` (default 4) auxiliary calls per session |
-| `kanban_task_completed` | Optional. Audits a task worker's completion summary against its ledger and posts the findings as a comment on the task, author `ysk-watch`. Quietly does nothing when the Hermes kanban store is absent. | Auxiliary call only when a high tripwire fired |
-| `subagent_stop` | Runs path-level tripwires over a delegated child's tool history and folds the findings into the parent session's ledger. | Free |
+| `transform_llm_output` | Runs on the answer about to be delivered, after Hermes's stop gates. Appends the high findings still unresolved (never surfaced, still open when nudging ended, or claims the answer makes without evidence), each once per session. Skipped in report-only mode, after an honest "could not finish" answer, and with `final_notice: false`. | Free, no model call |
+| `kanban_task_completed` | Optional. Audits a task worker's completion summary against its ledger and posts the findings as a comment on the task, author `ysk-watch`. What the comment carries is set by `completion_comment`. Quietly does nothing when the Hermes kanban store is absent. | Auxiliary call only when a high tripwire fired |
+| `subagent_stop` | Runs path-level tripwires over a delegated child's tool history, and hands the child's unresolved high findings to the parent as `subagent_unresolved` (cleared only by the parent citing its id). | Free |
 
-The plugin never touches the conversation, so prompt caching is preserved. The audit is a separate
+The plugin changes the conversation in two places only: the `pre_verify` nudge, and the notice
+appended to an answer before Hermes first stores it. Earlier turns and the system prompt are never
+rewritten, so the prompt cache is preserved. The audit is a separate
 `call_llm(task="ysk_watch")` over the ledger.
 
 Every check is appended to `$HERMES_HOME/logs/ysk-watch/checks.jsonl`, one JSON object per line.
@@ -282,7 +308,15 @@ plugins:
       threshold: 0.5
       demote: true
     retention_days: 30          # finished-day check logs kept
+    completion_comment: all     # all | high | off: what the task completion comment carries
+    final_notice: true          # append unresolved findings to an answer that was not held
 ```
+
+`completion_comment` decides what reaches the kanban task comment, which other agents read and
+which therefore costs inference. `all` (the default) posts high and warn findings. `high` posts
+high findings plus how the run ended (`self_reported_incomplete`, `justify_unresolved`), and
+leaves warnings in the check log for `summary`. `off` posts nothing. Warnings never make a model
+call or hold a turn; in a busy fleet the comment is their main cost.
 
 `YSK_WATCH_REPORT_ONLY=1` overrides `report_only` for one process. The intended rollout is a
 week in report-only mode, a look at `summary`, then enforcement.
@@ -385,11 +419,17 @@ against reviewed outcomes once there are enough of them.
   other command a later `cd` may not have run, so it is not followed. A terminal whose
   directory was never set by a `cd` has no git evidence, and the edit timeline applies.
 - Files ignored by `.gitignore` are not part of the fingerprint.
+- Outside git the fingerprint is size and modification time, not content: a `touch` reads as an
+  edit, and an edit that restores both exactly does not. File types outside the source list
+  (images, data files) are not part of it.
 - JUnit XML is read only when Python's bundled expat is 2.7.2 or newer (CVE-2025-59375); on an
   older interpreter a JUnit report is ignored and the summary line or exit code is used.
 - The model judge sees the agent's text between per-call random markers and is told it is data,
   but text written to persuade a monitor is a known attack on monitors. The judge can clear only
   rules the deterministic tier cannot settle, and only with stated confidence above the floor.
+- Holding a turn depends on Hermes running `pre_verify`, which it does only after file-tool edits;
+  otherwise findings are appended to the answer instead. An interrupted turn (`/stop`) is
+  delivered as it was, without the notice, because Hermes skips output transforms for it.
 - The honest-exit check reads English phrasing ("could not ... without weakening the tests",
   "the task is not done"). An answer that also claims everything passes is not taking it.
 

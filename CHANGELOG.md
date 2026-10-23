@@ -33,8 +33,12 @@ All notable changes to this project are documented here. The format follows
   bound is under `threshold` is demoted to `warn`. Review marks carry the rule revision and stop
   counting once that rule's entry in `RULE_REVISIONS` is bumped.
 - Configuration from the profile's `config.yaml` or `YSK_WATCH_CONFIG`: thresholds, protected
-  branches, safe-delete paths, extra secret patterns, justify and precision settings, and log
-  retention ([ysk_config.py](./ysk_config.py)).
+  branches, safe-delete paths, extra secret patterns, justify and precision settings, log
+  retention, and `completion_comment` (`all`, the default; `high`, which leaves warnings in the
+  log; or `off`) ([ysk_config.py](./ysk_config.py)).
+- Outside a git repository, or without git installed, a green run records a fingerprint of the
+  directory's source-like files (size and modification time), so a shell edit after it is still
+  stale evidence. Directories too large to walk within a second fall back to the edit timeline.
 - Per-repository allowlist in the committed `.ysk-watch.yaml`. Matching findings are downgraded
   one level and logged as `allowlisted`, never dropped. Claims and factual tripwires cannot be
   allowlisted.
@@ -53,6 +57,12 @@ All notable changes to this project are documented here. The format follows
   free numbered name instead of overwriting a backup.
 - If `pre_verify` itself fails, the turn is held once with a request to state what verifies
   the work, and the failure is logged as `guard_degraded`.
+- `transform_llm_output` hook: findings still unresolved when an answer is delivered are
+  appended to it (`final_notice`, on by default; off in report-only mode). This covers turns
+  Hermes does not run `pre_verify` for (no file-tool edits, such as an orchestrator that only
+  delegated, or shell-only work), and turns whose host-side nudge budget ran out.
+- `subagent_unresolved`: a delegated child's unresolved high findings are handed to the parent
+  on `subagent_stop`, where they hold the parent's turn or reach its answer.
 - Warn-level tripwires: `config_edited`, `mocked_subject`, `suppression_added`, `scope_shrink`,
   `dependency_drift`, and, from the cheat strategies measured by ImpossibleBench and METR,
   `always_equal`, `test_aware_code` and `harness_hook`.

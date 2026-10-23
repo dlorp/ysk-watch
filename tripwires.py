@@ -1765,7 +1765,7 @@ def _test_evidence(
             # The tree a green run describes, so a later claim can be checked against it.
             # Only where the run is known to have happened: the plugin's own working
             # directory says nothing about the terminal's.
-            tree = evidence.tree_fingerprint(run_dir)
+            tree = evidence.fingerprint(run_dir)
         claim = f"{invocation['tool']} run"
         if results is not None:
             claim += (

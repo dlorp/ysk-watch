@@ -3,16 +3,18 @@ label: ysk-watch
 kind: standalone
 version: "0.6.0"
 description: >-
-  Integrity watcher for autonomous agents and task workers. Deterministic tripwires on every tool
-  call (tests weakened, destructive commands, secrets touched, errors swallowed), a capped
-  auxiliary-model audit before an edited turn finishes, and an optional completion audit posted as
-  a comment on the task. Read-only, never touches the conversation, fails open.
-  YSK_WATCH_DISABLE=1 / YSK_WATCH_AUX=0 kill switches.
+  Integrity watcher for orchestrator agents, their subagents and task workers, and agents
+  working with a human. Deterministic tripwires on every tool call (tests weakened, monitoring
+  switched off, destructive commands, secrets touched), a capped auxiliary-model audit before an
+  edited turn finishes, an optional completion comment on the task, and findings still
+  unresolved when an answer is delivered appended to it. Fails open.
+  YSK_WATCH_DISABLE=1 / YSK_WATCH_AUX=0 / YSK_WATCH_REPORT_ONLY=1 switches.
 author: "dlorp"
 license: MIT
 requires_hermes: ">=0.21.5"
 provides_hooks:
   - post_tool_call
   - pre_verify
+  - transform_llm_output
   - kanban_task_completed
   - subagent_stop

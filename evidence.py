@@ -16,6 +16,7 @@ Every call here is read-only for the repository, bounded by a timeout, and retur
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pyexpat
@@ -24,6 +25,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
 
@@ -219,6 +221,112 @@ def tree_fingerprint(
         "paths": code_paths[:20],
         "count": len(code_paths),
     }
+
+
+# --- outside git -------------------------------------------------------------------------------
+# Without a repository there is no tree id, but a shell edit after a green run is just as stale.
+# The fallback names a directory by the size and modification time of its source-like files.
+# Caches, environments and build output are skipped, since a test run writes them itself; a
+# directory too large to walk quickly gets no name at all, and the caller keeps the hook-visible
+# edit timeline rather than trusting a partial walk.
+
+_DIR_MAX_FILES = 5000
+_DIR_MAX_SECONDS = 1.0
+_DIR_SKIP = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        ".next",
+        "dist",
+        "build",
+        "target",
+        "htmlcov",
+        ".coverage",
+        ".cache",
+        ".idea",
+        ".vscode",
+        ".eggs",
+        "coverage",
+    }
+)
+_DIR_SOURCE_RE = re.compile(
+    r"\.(?:py|pyi|js|jsx|mjs|cjs|ts|tsx|go|rs|java|kt|kts|scala|c|h|cc|cpp|hpp|cs|rb|php|"
+    r"swift|m|mm|sh|bash|zsh|fish|lua|pl|r|jl|ex|exs|erl|hs|ml|sql|toml|ya?ml|json|ini|cfg|"
+    r"conf|lock|txt|proto|graphql|vue|svelte)$|(?:^|/)(?:Makefile|Dockerfile|justfile)$",
+    re.IGNORECASE,
+)
+
+
+def dir_fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A name for a directory outside git: size and mtime of every source-like file under it.
+
+    Returns ``None`` for a missing directory, or one with more than 5,000 source files or that
+    takes over a second to walk: an incomplete walk would name a tree that does not exist.
+    """
+    if not directory:
+        return None
+    root = os.path.realpath(directory)
+    if not os.path.isdir(root):
+        return None
+    deadline = time.monotonic() + _DIR_MAX_SECONDS
+    entries: List[str] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as listing:
+                items = sorted(listing, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for item in items:
+            if time.monotonic() > deadline:
+                return None
+            try:
+                if item.is_symlink():
+                    continue
+                if item.is_dir():
+                    if item.name not in _DIR_SKIP and not item.name.endswith(".egg-info"):
+                        stack.append(item.path)
+                    continue
+                relative = os.path.relpath(item.path, root)
+                if is_doc(relative) or not _DIR_SOURCE_RE.search(relative):
+                    continue
+                info = item.stat()
+            except OSError:
+                continue
+            entries.append(f"{relative}\0{info.st_size}\0{info.st_mtime_ns}")
+            if len(entries) > _DIR_MAX_FILES:
+                return None
+    digest = hashlib.sha256("\n".join(sorted(entries)).encode("utf-8", "replace")).hexdigest()
+    return {
+        "hash": "d" + digest[:11],
+        "tree": digest,
+        "head": "",
+        "root": root,
+        "paths": [],
+        "count": len(entries),
+        "kind": "directory",
+    }
+
+
+def fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The git tree fingerprint inside a repository, the directory fingerprint outside one."""
+    if not directory:
+        return None
+    if repo_root(directory):
+        return tree_fingerprint(directory)
+    return dir_fingerprint(directory)
 
 
 def snapshot(

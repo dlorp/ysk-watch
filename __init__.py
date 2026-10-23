@@ -83,9 +83,12 @@ _FACTUAL_CATEGORIES = frozenset(
         "destructive_cmd",
         "config_tampered",
         "monitoring_weakened",
+        "subagent_unresolved",
     }
 )
 _MODEL_CANNOT_CLEAR = _DETERMINISTIC_CATEGORIES | _FACTUAL_CATEGORIES
+# How a run ended rather than what it did: always part of a task comment that is posted at all.
+_OUTCOME_CATEGORIES = frozenset({"self_reported_incomplete", "justify_unresolved"})
 
 _lock = threading.Lock()
 _COMMAND_TOOLS = ("terminal", "execute_code", "shell", "bash")
@@ -207,6 +210,9 @@ def _ledger(key_id: str) -> Dict[str, Any]:
                 # When the previous tool call finished: a test report older than that cannot
                 # describe the current command.
                 "last_call_ts": None,
+                # Findings appended to a delivered answer (signature -> finding): shown once,
+                # and handed to the parent when this session was a delegated child.
+                "appended": {},
             }
             _ledgers[key] = led
             while len(_ledgers) > _MAX_SESSIONS:
@@ -776,7 +782,7 @@ def _stale_test_evidence(
     passes = [e for e in events if e.get("category") == "test_run" and e.get("passed") is True]
     if not passes:
         return None
-    fingerprint = fingerprint or evidence.tree_fingerprint
+    fingerprint = fingerprint or evidence.fingerprint
     roots = roots or {}
     newest_by_root: Dict[str, Dict[str, Any]] = {}
     for run in sorted(passes, key=lambda e: int(e.get("seq") or 0)):
@@ -1174,7 +1180,7 @@ def _pre_verify(
     def fingerprint(where: Optional[str]) -> Optional[Dict[str, Any]]:
         key = where or ""
         if key not in fingerprints:
-            fingerprints[key] = evidence.tree_fingerprint(where)
+            fingerprints[key] = evidence.fingerprint(where)
         return fingerprints[key]
 
     root_here = _repo_root(directory) if directory else None
@@ -1394,6 +1400,8 @@ _CLEAR_HINTS = {
     "config_tampered": "restore the watcher's file and cite this id in your answer",
     "monitoring_weakened": "restore the monitoring or alerting, or cite this id and say who "
     "approved turning it off",
+    "subagent_unresolved": "check the child's change yourself, then cite this id and say what "
+    "you found",
     "error_swallowed": "handle the error, or say which failure is deliberately ignored",
     "unverified_claim": "run the tests and report the counts, or say in your answer what "
     "verifies the work instead",
@@ -1437,6 +1445,9 @@ def _on_kanban_task_completed(
     if _disabled() or not task_id:
         return
     try:
+        mode = ysk_config.get().get("completion_comment", "all")
+        if mode == "off":
+            return
         led = _ledger(task_id)
         events = _events(task_id)
         summary_text = (
@@ -1470,6 +1481,14 @@ def _on_kanban_task_completed(
                     f for f in findings if (f.get("category"), f.get("evidence")) not in cleared
                 ]
                 findings += audit.get("findings", [])
+        if mode == "high":
+            # Warnings stay in the check log for ``summary``; the task comment, which other
+            # agents read, carries only what blocked or would have, and how the run ended.
+            findings = [
+                f
+                for f in findings
+                if f.get("severity") == "high" or f.get("category") in _OUTCOME_CATEGORIES
+            ]
         order = {"high": 0, "warn": 1, "info": 2}
         findings.sort(key=lambda f: order.get(f.get("severity"), 3))
         # Only findings that actually reach the comment are marked reported, so a finding
@@ -1544,10 +1563,67 @@ def _post_kanban_comment(task_id: str, findings: List[Dict[str, Any]], run_id: A
         logger.debug("ysk-watch: kanban comment failed: %s", exc)
 
 
+def _child_unresolved(child_session_id: str) -> List[Dict[str, Any]]:
+    """High findings a delegated child ended with: still open, never surfaced, appended to its
+    answer, or released after its nudges ran out. Findings it resolved or justified are not."""
+    led = _ledger(child_session_id)
+    events = _events(child_session_id)
+    with _lock:
+        open_findings = [dict(state["finding"]) for state in led["open"].values()]
+        appended = [dict(finding) for finding in led["appended"].values()]
+        reported = set(led["reported"])
+    unresolved = open_findings + appended + _new_high(events, reported)
+    unresolved += [e for e in events if e.get("category") == "justify_unresolved"]
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for finding in unresolved:
+        if finding.get("severity") != "high" and finding.get("category") != "justify_unresolved":
+            continue
+        signature = _signature(finding)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(finding)
+    return out
+
+
 def _on_subagent_stop(
-    parent_session_id: str = "", child_role: Any = None, tool_call_history: Any = None, **_: Any
+    parent_session_id: str = "",
+    child_role: Any = None,
+    tool_call_history: Any = None,
+    child_session_id: Any = None,
+    **_: Any,
 ) -> None:
-    if _disabled() or not parent_session_id or not isinstance(tool_call_history, list):
+    if _disabled() or not parent_session_id:
+        return
+    if (
+        isinstance(child_session_id, str)
+        and child_session_id
+        and child_session_id != parent_session_id
+    ):
+        try:
+            # A child's unresolved findings become the parent's: the parent is the agent about
+            # to report, so they hold its turn, or reach its answer when the turn cannot be held.
+            handed = [
+                {
+                    "category": "subagent_unresolved",
+                    "severity": "high",
+                    "claim": f"delegated child ({child_role or 'child'}) left {f.get('category')} "
+                    f"unresolved: {f.get('claim')}",
+                    "evidence": f"{f.get('id')}: {f.get('evidence')}"[:300],
+                    "source": f"subagent:{child_role or 'child'}",
+                }
+                for f in _child_unresolved(child_session_id)
+            ]
+            if handed:
+                _record([parent_session_id], handed)
+                for finding in handed:
+                    _log_check(
+                        "subagent_tripwire", {"parent_session_id": parent_session_id, **finding}
+                    )
+        except Exception:
+            logger.debug("ysk-watch subagent_stop (child ledger) failed", exc_info=True)
+    if not isinstance(tool_call_history, list):
         return
     try:
         # The history is metadata-only (tool name, status, sanitized path targets; no contents or
@@ -1716,8 +1792,98 @@ def _parse_json(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+# --- the delivered answer ------------------------------------------------------------------------
+# The host lets a plugin hold a turn only after the agent edited files through its file tools.
+# An orchestrator that only delegated, a turn whose edits went through the shell, or an answer
+# that claims a pass in conversation never reaches ``pre_verify``, and a turn whose host-side
+# nudge budget ran out ends with findings still open. Whatever is unresolved when the answer is
+# delivered is appended to it, so the human or the parent agent reading it sees it.
+
+_NOTICE_HEADER = "[ysk-watch] Not resolved when this answer was sent:"
+
+
+def _final_notice(key_id: str, session_id: str, text: str) -> Optional[str]:
+    cfg = _apply_rules()
+    if not cfg.get("final_notice", True) or _honest_exit(text):
+        return None
+    led = _ledger(key_id)
+    events = _events(key_id)
+    with _lock:
+        roots = {root: dict(state) for root, state in led["roots"].items()}
+        still_open = [dict(state["finding"]) for state in led["open"].values()]
+        appended = set(led["appended"])  # signatures
+        reported = set(led["reported"])
+    claims = [
+        c
+        for c in (
+            _unverified_claim(text, events),
+            _stale_test_evidence(text, events, roots),
+            _truncated_claim(text, events),
+        )
+        if c and c.get("severity") == "high"
+    ]
+    candidates = still_open + _new_high(events, reported) + claims
+    candidates += [e for e in events if e.get("category") == "justify_unresolved"]
+    _stamp(candidates, key_id)
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    for finding in candidates:
+        if finding.get("severity") != "high" and finding.get("category") != "justify_unresolved":
+            continue
+        signature = _signature(finding)
+        if signature in seen or signature in appended:
+            continue
+        seen.add(signature)
+        items.append(finding)
+    if not items:
+        return None
+    repo = _repo_name(_last_cwd(key_id))
+    if cfg.get("report_only"):
+        _log_check("would_append", {"session_id": session_id, "repo": repo, "findings": items})
+        return None
+    with _lock:
+        for finding in items:
+            led["appended"][_signature(finding)] = dict(finding)
+            led["reported"].add(_signature(finding))
+            led["open"].pop(str(finding.get("id")), None)
+    _log_check("final_notice", {"session_id": session_id, "repo": repo, "findings": items})
+    lines = ["---", _NOTICE_HEADER]
+    for finding in items[:_MAX_FINDINGS_PER_NUDGE]:
+        lines.append(
+            tripwires.redact(
+                f"- {finding.get('id')} {finding.get('category')}: {finding.get('claim')} "
+                f"(evidence: {str(finding.get('evidence') or '')[:200]})"
+            )
+        )
+    if len(items) > _MAX_FINDINGS_PER_NUDGE:
+        lines.append(f"- and {len(items) - _MAX_FINDINGS_PER_NUDGE} more in the ysk-watch log")
+    return "\n".join(lines)
+
+
+def _on_transform_llm_output(
+    response_text: Any = None, session_id: str = "", **_: Any
+) -> Optional[str]:
+    """Append unresolved findings to the answer about to be delivered; ``None`` leaves it."""
+    if _disabled() or not isinstance(response_text, str) or not response_text.strip():
+        return None
+    key_id = session_id or os.environ.get("HERMES_KANBAN_TASK", "") or "_"
+    try:
+        notice = _final_notice(key_id, session_id, response_text)
+    except Exception as exc:
+        logger.debug("ysk-watch transform_llm_output failed", exc_info=True)
+        _log_check(
+            "guard_degraded",
+            {"session_id": session_id, "hook": "transform_llm_output", "error": str(exc)[:300]},
+        )
+        return None
+    if not notice:
+        return None
+    return response_text.rstrip() + "\n\n" + notice
+
+
 def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("pre_verify", _on_pre_verify)
+    ctx.register_hook("transform_llm_output", _on_transform_llm_output)
     ctx.register_hook("kanban_task_completed", _on_kanban_task_completed)
     ctx.register_hook("subagent_stop", _on_subagent_stop)

@@ -42,6 +42,11 @@ DEFAULTS: Dict[str, Any] = {
     "justify": {"max_nudges": 3, "min_confidence": 0.7},
     "precision": {"min_samples": 5, "threshold": 0.5, "demote": True},
     "retention_days": 30,
+    # What the kanban completion comment carries: "all" (high and warn), "high" (high plus how
+    # the run ended), or "off".
+    "completion_comment": "all",
+    # Append findings still unresolved when an answer is delivered (turns that could not be held).
+    "final_notice": True,
 }
 
 _CACHE: Dict[str, Any] = {
@@ -204,6 +209,14 @@ def _sanitize(cfg: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "demote": limits.get("demote") is not False,
     }
+    comment = cfg.get("completion_comment")
+    # YAML 1.1 reads a bare ``off`` as false and ``on`` as true.
+    if comment is False:
+        comment = "off"
+    elif comment is True:
+        comment = "all"
+    out["completion_comment"] = comment if comment in ("all", "high", "off") else "all"
+    out["final_notice"] = cfg.get("final_notice") is not False
     out["retention_days"] = _number(
         cfg.get("retention_days"), DEFAULTS["retention_days"], low=0, high=3650, kind=int
     )

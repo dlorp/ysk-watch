@@ -1069,3 +1069,203 @@ def test_editing_the_watchers_profile_settings_is_high(ysk, tmp_path):
     assert [e["severity"] for e in ysk._events("s2") if e["category"] == "config_tampered"] == [
         "warn"
     ]
+
+
+# --- outside git ---------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def plain(tmp_path):
+    """A project directory that is not a git repository."""
+    path = tmp_path / "plain"
+    (path / "src").mkdir(parents=True)
+    (path / "src" / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    return path
+
+
+def test_outside_git_a_shell_edit_after_a_green_run_is_stale(ysk, plain):
+    _terminal(ysk, f"cd {plain} && python -m pytest -q", "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["tree"].startswith("d")
+    (plain / "src" / "calc.py").write_text("def add(a, b):\n    return a - b + 0\n")
+    held = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert held and "stale_test_evidence" in held["message"]
+
+
+def test_outside_git_test_artifacts_and_docs_do_not_make_evidence_stale(ysk, plain):
+    _terminal(ysk, f"cd {plain} && python -m pytest -q", "1 passed in 0.01s")
+    (plain / ".pytest_cache").mkdir()
+    (plain / ".pytest_cache" / "v.json").write_text("{}")
+    (plain / "src" / "__pycache__").mkdir()
+    (plain / "src" / "__pycache__" / "calc.cpython-311.pyc").write_bytes(b"\0")
+    (plain / "NOTES.md").write_text("# notes\n")
+    assert ysk._on_pre_verify(session_id="s1", final_response="All tests pass.") is None
+
+
+def test_outside_git_a_directory_too_large_to_walk_falls_back_to_the_timeline(
+    ysk, plain, monkeypatch
+):
+    monkeypatch.setattr(ysk.evidence, "_DIR_MAX_FILES", 0)
+    _terminal(ysk, f"cd {plain} && python -m pytest -q", "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["passed"] is True and not run.get("tree")
+    _patch(ysk, str(plain / "src" / "calc.py"), "a + b", "a - b")
+    held = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert held and "stale_test_evidence" in held["message"]
+
+
+def test_without_git_installed_nothing_breaks(ysk, repo, monkeypatch, tmp_path):
+    empty = tmp_path / "nobin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    _terminal(ysk, f"cd {repo} && python -m pytest -q", "1 passed in 0.01s")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a * b\n")
+    held = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert held and "stale_test_evidence" in held["message"]
+    assert not any(c.get("kind") == "guard_degraded" for c in _checks(ysk))
+
+
+# --- completion comment --------------------------------------------------------------------------
+
+
+def _complete(ysk, monkeypatch, tmp_path, mode):
+    posted = []
+    monkeypatch.setattr(
+        ysk, "_post_kanban_comment", lambda task, findings, run: posted.append(findings)
+    )
+    if mode:
+        _config(tmp_path, monkeypatch, f"ysk_watch:\n  completion_comment: {mode}\n")
+    _patch(ysk, "src/a.py", "x = f()\n", "x = f()  # type: ignore\n", session="t1")
+    ysk._on_kanban_task_completed(task_id="t1", summary="Done.")
+    return posted
+
+
+def test_completion_comment_carries_warnings_by_default(ysk, monkeypatch, tmp_path):
+    posted = _complete(ysk, monkeypatch, tmp_path, None)
+    assert posted and posted[0][0]["category"] == "suppression_added"
+
+
+def test_completion_comment_high_leaves_warnings_in_the_log(ysk, monkeypatch, tmp_path):
+    assert _complete(ysk, monkeypatch, tmp_path, "high") == []
+    assert any(c.get("category") == "suppression_added" for c in _checks(ysk))
+
+
+def test_completion_comment_high_still_says_how_the_run_ended(ysk, monkeypatch, tmp_path):
+    posted = []
+    monkeypatch.setattr(
+        ysk, "_post_kanban_comment", lambda task, findings, run: posted.append(findings)
+    )
+    _config(tmp_path, monkeypatch, "ysk_watch:\n  completion_comment: high\n")
+    _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "", session="t1")
+    ysk._on_pre_verify(session_id="t1", final_response="done")
+    ysk._on_pre_verify(
+        session_id="t1",
+        final_response="I could not make this pass without weakening the assertions.",
+        attempt=1,
+    )
+    ysk._on_kanban_task_completed(task_id="t1", summary="Stopped.")
+    categories = {f["category"] for f in posted[0]}
+    assert {"test_weakened", "self_reported_incomplete"} <= categories
+
+
+def test_completion_comment_off_posts_nothing(ysk, monkeypatch, tmp_path):
+    assert _complete(ysk, monkeypatch, tmp_path, "off") == []
+
+
+# --- the delivered answer ---------------------------------------------------------------------
+
+
+def _deliver(ysk, text, session="s1"):
+    return ysk._on_transform_llm_output(response_text=text, session_id=session, turn_id="t")
+
+
+def test_an_orchestrator_that_only_delegated_cannot_claim_a_pass_unnoticed(ysk):
+    out = _deliver(ysk, "Delegated the fix; all tests pass.")
+    assert out and out.startswith("Delegated the fix; all tests pass.")
+    assert "[ysk-watch] Not resolved" in out and "unverified_claim" in out
+
+
+def test_a_shell_only_turn_gets_its_findings_appended_once(ysk):
+    _terminal(ysk, "rm -rf ~/work/old-checkout", "")
+    first = _deliver(ysk, "Cleaned up the workspace.")
+    assert first and "destructive_cmd" in first
+    assert _deliver(ysk, "Anything else?") is None
+
+
+def test_findings_still_open_when_the_host_stops_nudging_are_appended(ysk):
+    _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "")
+    for attempt in range(3):  # the host's max_verify_nudges default
+        assert ysk._on_pre_verify(session_id="s1", final_response="done", attempt=attempt)
+    out = _deliver(ysk, "done")
+    assert out and "test_weakened" in out
+
+
+def _child_leaves_a_finding(ysk):
+    """A delegated child, in its own session, deletes a checkout and reports without fixing it."""
+    _terminal(ysk, "rm -rf ~/work/old-checkout", "", session="child")
+    child_answer = _deliver(ysk, "Cleaned up.", session="child")
+    assert child_answer and "destructive_cmd" in child_answer  # what the parent reads
+    ysk._on_subagent_stop(
+        parent_session_id="parent",
+        child_session_id="child",
+        child_role="coder",
+        tool_call_history=[],
+    )
+
+
+def test_a_childs_unresolved_finding_holds_the_parents_turn(ysk):
+    _child_leaves_a_finding(ysk)
+    _patch(ysk, "src/app.py", "x = 1\n", "x = 2\n", session="parent")
+    held = ysk._on_pre_verify(session_id="parent", final_response="Merged the child's work.")
+    assert (
+        held and "subagent_unresolved" in held["message"] and "destructive_cmd" in held["message"]
+    )
+
+
+def test_a_childs_unresolved_finding_reaches_an_orchestrators_answer(ysk):
+    _child_leaves_a_finding(ysk)
+    out = _deliver(ysk, "The child finished the cleanup.", session="parent")
+    assert out and "subagent_unresolved" in out
+
+
+def test_a_finding_the_child_resolved_is_not_handed_up(ysk):
+    _patch(ysk, "tests/test_a.py", "    assert f() == 3\n", "", session="child")
+    finding = [e for e in ysk._events("child") if e.get("category") == "test_weakened"][0]
+    assert ysk._on_pre_verify(session_id="child", final_response="done")
+    assert (
+        ysk._on_pre_verify(
+            session_id="child",
+            final_response=f"{finding['id']} tests/test_a.py: assertion moved to test_b.",
+            attempt=1,
+        )
+        is None
+    )
+    assert _deliver(ysk, "done", session="child") is None
+    ysk._on_subagent_stop(
+        parent_session_id="parent",
+        child_session_id="child",
+        child_role="coder",
+        tool_call_history=[],
+    )
+    assert "subagent_unresolved" not in _categories(ysk, "parent")
+
+
+def test_a_clean_answer_is_left_alone(ysk):
+    _terminal(ysk, "python -m pytest -q", "3 passed in 0.1s")
+    assert _deliver(ysk, "Done; 3 passed.") is None
+
+
+def test_nothing_is_appended_in_report_only_mode(ysk, monkeypatch):
+    monkeypatch.setenv("YSK_WATCH_REPORT_ONLY", "1")
+    assert _deliver(ysk, "All tests pass.") is None
+    assert any(c.get("kind") == "would_append" for c in _checks(ysk))
+
+
+def test_an_honest_exit_is_not_annotated(ysk):
+    _terminal(ysk, "rm -rf ~/work/old-checkout", "")
+    assert _deliver(ysk, "I could not finish this without weakening the tests.") is None
+
+
+def test_final_notice_can_be_turned_off(ysk, tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, "ysk_watch:\n  final_notice: false\n")
+    assert _deliver(ysk, "All tests pass.") is None
