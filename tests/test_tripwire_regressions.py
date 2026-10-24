@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -553,8 +554,14 @@ def test_checks_log_rotates_once_it_is_large(ysk, monkeypatch):
     checks.write_text("x" * 200, encoding="utf-8")
     monkeypatch.setattr(ysk, "_MAX_CHECKS_BYTES", 100)
     ysk._log_check("tripwire", {"session_id": "s1"})
-    assert (log_dir / "checks.jsonl.1").exists()
+    today = time.strftime("%Y-%m-%d")
+    assert (log_dir / f"checks-{today}.jsonl").read_text(encoding="utf-8") == "x" * 200
     assert checks.stat().st_size < 200
+    # A second rollover the same day takes the next free name instead of overwriting.
+    checks.write_text("y" * 200, encoding="utf-8")
+    ysk._log_check("tripwire", {"session_id": "s1"})
+    assert (log_dir / f"checks-{today}.1.jsonl").read_text(encoding="utf-8") == "y" * 200
+    assert (log_dir / f"checks-{today}.jsonl").read_text(encoding="utf-8") == "x" * 200
 
 
 def test_session_ledger_file_is_trimmed_when_it_grows(ysk, monkeypatch):
