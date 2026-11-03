@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-03
+
+### Fixed
+
+- The working-tree fingerprint no longer copies file contents to disk. It staged every changed
+  and untracked file with `git add -A` into a throwaway object directory under the system temp
+  directory, so a repository with many uncommitted files cost its full size per fingerprint,
+  and a run killed before its cleanup left that copy behind. On one host 43 such directories
+  (about 2 GB each, 61 GB in total) filled the disk. Changed paths are now hashed with
+  `git update-index --info-only` and the tree is written with `write-tree --missing-ok`: the
+  tree id is identical to before (verified against the previous method), only the index and
+  tree objects are written (264 MB to 8.6 MB on a 12,000-file working tree), and existing
+  evidence stays valid ([evidence.py](./evidence.py)).
+- Fingerprint temp directories left by killed runs are removed: directories with the
+  fingerprint prefix untouched for an hour are swept, at most once every ten minutes per
+  process, so a fingerprint running in another process is never disturbed.
+
 ## [0.6.0] - 2026-10-22
 
 ### Added
@@ -124,4 +141,5 @@ All notable changes to this project are documented here. The format follows
   virtualenvs, `node_modules`), so a Python run after a green run does not make it stale in a
   repository that does not ignore them.
 
+[0.6.1]: https://github.com/dlorp/ysk-watch/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/dlorp/ysk-watch/compare/81e83ab...v0.6.0

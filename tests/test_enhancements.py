@@ -1295,3 +1295,186 @@ def test_untracked_caches_do_not_change_the_fingerprint(ysk, repo):
     assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before
     (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
     assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before
+
+
+def _reference_tree(ysk, repo: Path) -> str:
+    """The tree id the previous implementation produced: ``git add -A`` into a throwaway index
+    with a throwaway object directory, docs reset to HEAD."""
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        index = os.path.join(tmp, "index")
+        objects = os.path.join(tmp, "objects")
+        os.mkdir(objects)
+        shutil.copy2(repo / ".git" / "index", index)
+        env = dict(
+            os.environ,
+            GIT_INDEX_FILE=index,
+            GIT_OBJECT_DIRECTORY=objects,
+            GIT_ALTERNATE_OBJECT_DIRECTORIES=str(repo / ".git" / "objects"),
+        )
+
+        def run(*args):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args], capture_output=True, text=True, env=env, check=True
+            ).stdout
+
+        run("add", "-A", "--", ".", *ysk.evidence._CACHE_PATHSPECS)
+        docs = [p for p in ysk.evidence._status_paths(str(repo)) if ysk.evidence.is_doc(p)]
+        if docs:
+            run("reset", "-q", "HEAD", "--", *[f":(literal){p}" for p in docs])
+        return run("write-tree").strip()
+
+
+def test_the_fingerprint_tree_matches_staging_the_whole_working_tree(ysk, repo):
+    (repo / "README.md").write_text("# proj\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "docs")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return b + a\n")
+    (repo / "src" / "new dir").mkdir()
+    (repo / "src" / "new dir" / "extra mod.py").write_text("X = 1\n")
+    (repo / "data.bin").write_bytes(bytes(range(256)) * 64)
+    (repo / "tests" / "test_calc.py").unlink()
+    (repo / "README.md").write_text("# proj, edited\n")
+    (repo / "src" / "__pycache__").mkdir()
+    (repo / "src" / "__pycache__" / "calc.cpython-311.pyc").write_bytes(b"\0" * 32)
+    fingerprint = ysk.evidence.tree_fingerprint(str(repo))
+    assert fingerprint is not None
+    assert fingerprint["tree"] == _reference_tree(ysk, repo)
+
+
+def _messy_history(repo: Path) -> None:
+    (repo / "README.md").write_text("# proj\n")
+    (repo / "moved.py").write_text("A = 1\n")
+    (repo / "staged_move.py").write_text("B = 2\n")
+    (repo / "run.sh").write_text("echo hi\n")
+    os.symlink("src/calc.py", repo / "link.py")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "more")
+
+
+@pytest.mark.parametrize("include_docs", [False, True])
+def test_the_fingerprint_tree_matches_staging_through_renames_and_staged_edits(
+    ysk, repo, include_docs
+):
+    _messy_history(repo)
+    _git(repo, "mv", "staged_move.py", "staged_moved_here.py")  # staged rename
+    # worktree rename, then intent-to-add
+    (repo / "moved.py").rename(repo / "renamed_in_worktree.py")
+    _git(repo, "add", "-N", "renamed_in_worktree.py")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n")
+    _git(repo, "add", "src/calc.py")  # staged, not committed
+    (repo / "run.sh").chmod(0o755)  # exec bit
+    (repo / "link.py").unlink()
+    os.symlink("tests/test_calc.py", repo / "link.py")  # symlink retarget
+    (repo / "-dash.py").write_text("C = 3\n")
+    (repo / "snowman \u2603.py").write_text("D = 4\n")
+    (repo / "README.md").write_text("# proj, edited\n")
+    fingerprint = ysk.evidence.tree_fingerprint(str(repo), include_docs=include_docs)
+    assert fingerprint is not None
+    if include_docs:
+        assert fingerprint["tree"] == _reference_tree_with_docs(ysk, repo)
+    else:
+        assert fingerprint["tree"] == _reference_tree(ysk, repo)
+
+
+def test_a_renamed_away_file_leaves_the_fingerprint(ysk, repo):
+    _messy_history(repo)
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "moved.py").rename(repo / "renamed_in_worktree.py")
+    _git(repo, "add", "-N", "renamed_in_worktree.py")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert before["tree"] != after["tree"]
+    assert after["tree"] == _reference_tree(ysk, repo)
+
+
+def _reference_tree_with_docs(ysk, repo: Path) -> str:
+    """``_reference_tree`` without the docs reset: what ``include_docs=True`` must match."""
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        index = os.path.join(tmp, "index")
+        objects = os.path.join(tmp, "objects")
+        os.mkdir(objects)
+        shutil.copy2(repo / ".git" / "index", index)
+        env = dict(
+            os.environ,
+            GIT_INDEX_FILE=index,
+            GIT_OBJECT_DIRECTORY=objects,
+            GIT_ALTERNATE_OBJECT_DIRECTORIES=str(repo / ".git" / "objects"),
+        )
+
+        def run(*args):
+            return subprocess.run(
+                ["git", "-C", str(repo), *args], capture_output=True, text=True, env=env, check=True
+            ).stdout
+
+        run("add", "-A", "--", ".", *ysk.evidence._CACHE_PATHSPECS)
+        return run("write-tree").strip()
+
+
+def test_fingerprinting_does_not_copy_file_contents_to_the_temp_directory(ysk, repo, monkeypatch):
+    import tempfile
+
+    (repo / "big.bin").write_bytes(os.urandom(2 * 1024 * 1024))
+    sizes = []
+    real = tempfile.TemporaryDirectory
+
+    class Recording(real):
+        def __exit__(self, *exc):
+            sizes.append(sum(f.stat().st_size for f in Path(self.name).rglob("*") if f.is_file()))
+            return super().__exit__(*exc)
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", Recording)
+    assert ysk.evidence.tree_fingerprint(str(repo)) is not None
+    assert sizes and sizes[0] < 1024 * 1024
+
+
+def test_temp_directories_left_by_killed_fingerprints_are_swept(ysk, tmp_path, monkeypatch):
+    import tempfile
+
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    stale = temp / f"{ysk.evidence._TEMP_PREFIX}stale"
+    fresh = temp / f"{ysk.evidence._TEMP_PREFIX}fresh"
+    other = temp / "someone-else"
+    for path in (stale, fresh, other):
+        (path / "objects").mkdir(parents=True)
+        (path / "objects" / "blob").write_bytes(b"x" * 64)
+    old = time.time() - 2 * ysk.evidence._STALE_TEMP_AGE_S
+    for path in (stale, other):
+        os.utime(path, (old, old))
+    monkeypatch.setattr(ysk.evidence, "_last_sweep", 0.0)
+    assert ysk.evidence._sweep_stale_temp_dirs() == 1
+    assert not stale.exists() and fresh.exists() and other.exists()
+    os.utime(fresh, (old, old))
+    assert ysk.evidence._sweep_stale_temp_dirs() == 0  # rate-limited within the interval
+    assert fresh.exists()
+    monkeypatch.setattr(ysk.evidence, "_last_sweep", 0.0)
+    assert ysk.evidence._sweep_stale_temp_dirs() == 1  # once the interval passes, it goes
+    assert not fresh.exists()
+
+
+def test_the_sweep_never_follows_a_symlink_or_removes_a_plain_file(ysk, tmp_path, monkeypatch):
+    import tempfile
+
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    target = tmp_path / "precious"
+    (target / "objects").mkdir(parents=True)
+    (target / "objects" / "keep").write_bytes(b"k")
+    link = temp / f"{ysk.evidence._TEMP_PREFIX}link"
+    os.symlink(target, link)
+    plain = temp / f"{ysk.evidence._TEMP_PREFIX}file"
+    plain.write_bytes(b"p")
+    old = time.time() - 2 * ysk.evidence._STALE_TEMP_AGE_S
+    for path in (target, plain):
+        os.utime(path, (old, old))
+    os.utime(link, (old, old), follow_symlinks=False)
+    monkeypatch.setattr(ysk.evidence, "_last_sweep", 0.0)
+    assert ysk.evidence._sweep_stale_temp_dirs() == 0
+    assert (target / "objects" / "keep").exists() and link.is_symlink() and plain.exists()
