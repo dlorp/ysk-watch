@@ -33,6 +33,13 @@ _GIT_TIMEOUT_S = 5.0
 _STAGE_TIMEOUT_S = 20.0
 _MAX_LISTED_PATHS = 200
 _PATHSPEC_CHUNK = 100
+# A fingerprint killed mid-run (a worker crash or SIGKILL) skips its context manager's cleanup
+# and leaves its throwaway index behind. Nothing older than this is still in use.
+_TEMP_PREFIX = "ysk-watch-fp-"
+_STALE_TEMP_AGE_S = 3600.0
+_SWEEP_INTERVAL_S = 600.0
+_SWEEP_MAX_REMOVALS = 50
+_last_sweep = 0.0
 _MAX_REPORT_BYTES = 8 * 1024 * 1024
 
 # Docs by extension only. A directory name says nothing about what is in it: ``src/docs/``
@@ -51,6 +58,7 @@ def _run_git(
     *,
     env: Optional[Dict[str, str]] = None,
     timeout: float = _GIT_TIMEOUT_S,
+    input: Optional[str] = None,
 ) -> Tuple[bool, str]:
     here = directory or os.getcwd()
     # ``git status`` refreshes the real index opportunistically and takes ``index.lock`` to
@@ -64,6 +72,7 @@ def _run_git(
             text=True,
             timeout=timeout,
             env=run_env,
+            input=input,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return False, ""
@@ -84,7 +93,7 @@ def repo_root(directory: Optional[str]) -> Optional[str]:
     return root or None
 
 
-def _status_paths(directory: Optional[str]) -> List[str]:
+def _status_paths(directory: Optional[str], *, include_sources: bool = False) -> List[str]:
     """Paths that differ from HEAD (staged, unstaged or untracked), root-relative.
 
     ``-z`` output, so names with spaces, quotes or non-ASCII bytes come back verbatim instead
@@ -101,10 +110,16 @@ def _status_paths(directory: Optional[str]) -> List[str]:
         if len(entry) < 4:
             continue
         code, path = entry[:2], entry[3:]
-        if code[0] in "RC":
+        source = ""
+        if code[0] in "RC" or code[1] in "RC":
+            source = parts[index] if index < len(parts) else ""
             index += 1
         if path and path not in names:
             names.append(path)
+        # The fingerprint needs the source too: a path the tree must drop is as much a change
+        # as the one it must add.
+        if include_sources and source and source not in names:
+            names.append(source)
     return names
 
 
@@ -146,6 +161,49 @@ def _git_path(root: str, name: str) -> Optional[str]:
     return value if os.path.isabs(value) else os.path.join(root, value)
 
 
+def _sweep_stale_temp_dirs(now: Optional[float] = None) -> int:
+    """Remove fingerprint temp directories that killed runs left behind; return the count.
+
+    Only directories named with this module's prefix and untouched for ``_STALE_TEMP_AGE_S``
+    are removed, so a fingerprint running in another process is never disturbed. Runs at most
+    once per ``_SWEEP_INTERVAL_S`` per process.
+    """
+    global _last_sweep
+    now = time.time() if now is None else now
+    if now - _last_sweep < _SWEEP_INTERVAL_S:
+        return 0
+    _last_sweep = now
+    # Without fd-based rmtree a directory swapped for a symlink between the checks below and the
+    # removal could redirect it; leave the leftovers rather than risk that.
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        return 0
+    try:
+        entries = list(os.scandir(tempfile.gettempdir()))
+    except OSError:
+        return 0
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    removed = 0
+    for entry in entries:
+        if removed >= _SWEEP_MAX_REMOVALS:
+            break
+        if not entry.name.startswith(_TEMP_PREFIX):
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if uid is not None and info.st_uid != uid:
+            continue  # a shared temp directory: another user's run is not ours to remove
+        if now - info.st_mtime < _STALE_TEMP_AGE_S:
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+        if not os.path.exists(entry.path):
+            removed += 1
+    return removed
+
+
 def tree_fingerprint(
     directory: Optional[str], *, include_docs: bool = False
 ) -> Optional[Dict[str, Any]]:
@@ -174,11 +232,16 @@ def tree_fingerprint(
     objects_path = _git_path(root, "objects")
     if not objects_path:
         return None
-    paths = [path for path in _status_paths(root) if not _CACHE_PATH_RE.search(path)]
+    paths = [
+        path
+        for path in _status_paths(root, include_sources=True)
+        if not _CACHE_PATH_RE.search(path)
+    ]
     docs = [path for path in paths if is_doc(path)] if not include_docs else []
     code_paths = [path for path in paths if path not in docs]
     try:
-        with tempfile.TemporaryDirectory(prefix="ysk-watch-fp-") as tmp:
+        _sweep_stale_temp_dirs()
+        with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
             temp_index = os.path.join(tmp, "index")
             temp_objects = os.path.join(tmp, "objects")
             os.mkdir(temp_objects)
@@ -205,28 +268,37 @@ def tree_fingerprint(
                 ok, _ = _run_git(root, ["read-tree", "HEAD"], env=env)
                 if not ok:
                     return None
-            # Clean filters run on ``git add``; git-lfs's writes into the real ``.git/lfs``.
-            # Hashing the raw file instead is consistent on both sides of a comparison.
-            ok, _ = _run_git(
-                root,
-                [
-                    "-c",
-                    "filter.lfs.clean=",
-                    "-c",
-                    "filter.lfs.process=",
-                    "-c",
-                    "filter.lfs.required=false",
-                    "add",
-                    "-A",
-                    "--",
-                    ".",
-                    *_CACHE_PATHSPECS,
-                ],
-                env=env,
-                timeout=_STAGE_TIMEOUT_S,
-            )
-            if not ok:
-                return None
+            # Each changed path's object id goes into the throwaway index without the object
+            # being written (``--info-only``): the tree id is the one ``git add -A`` would
+            # produce, but no file content is copied into the temp directory, so a large
+            # untracked file costs one read rather than its size on disk. Clean filters run
+            # when a file is hashed; git-lfs's writes into the real ``.git/lfs``, so the raw
+            # file is hashed instead, consistently on both sides of a comparison.
+            # One process reads every path from stdin: a single index write and a single
+            # timeout however many paths changed.
+            if paths:
+                ok, _ = _run_git(
+                    root,
+                    [
+                        "-c",
+                        "filter.lfs.clean=",
+                        "-c",
+                        "filter.lfs.process=",
+                        "-c",
+                        "filter.lfs.required=false",
+                        "update-index",
+                        "--add",
+                        "--remove",
+                        "--info-only",
+                        "-z",
+                        "--stdin",
+                    ],
+                    env=env,
+                    timeout=_STAGE_TIMEOUT_S,
+                    input="".join(path.rstrip("/") + "\0" for path in paths),
+                )
+                if not ok:
+                    return None
             for start in range(0, len(docs), _PATHSPEC_CHUNK):
                 chunk = docs[start : start + _PATHSPEC_CHUNK]
                 ok, _ = _run_git(
@@ -234,7 +306,8 @@ def tree_fingerprint(
                 )
                 if not ok:
                     return None
-            ok, tree = _run_git(root, ["write-tree"], env=env)
+            # The blobs hashed above were never written; trees are, and they are small.
+            ok, tree = _run_git(root, ["write-tree", "--missing-ok"], env=env)
             tree = tree.strip()
             if not ok or not tree:
                 return None
