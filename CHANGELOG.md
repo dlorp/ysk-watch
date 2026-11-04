@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-03
+
+### Security
+
+- Repository config no longer steers or runs anything while the watcher reads the tree. Every
+  git call carries command-line overrides (`GIT_CONFIG_COUNT`, which outranks config files) for
+  `core.fsmonitor`, `core.untrackedCache`, `core.ignoreStat`, `core.checkStat`,
+  `core.trustctime`, `core.fileMode`, `core.hooksPath`, `core.splitIndex` and `protocol.allow`,
+  plus `GIT_NO_LAZY_FETCH`, an empty `GIT_ALLOW_PROTOCOL` (which a repository's
+  `protocol.<name>.allow` cannot override) and `GIT_NO_REPLACE_OBJECTS`. An inherited `-c`
+  (`GIT_CONFIG_PARAMETERS`) and pathspec switches are removed. Every configured filter driver
+  is turned off, not only git-lfs, including in `write-tree`, which re-hashes racily clean
+  files, and so is every config-defined hook (git 2.54+), which `core.hooksPath` does not
+  reach ([evidence.py](./evidence.py)).
+- Submodules are compared by commit (`--ignore-submodules=dirty`, `--submodule=short`), so git
+  starts no process inside a submodule, where the submodule's own config would apply. The
+  fingerprint recorded a submodule by its commit before too.
+- Edits hidden behind assume-unchanged or skip-worktree marks change the fingerprint. The marks
+  are cleared only in the throwaway index; the repository's own index keeps them.
+- `.git/info/exclude` and a repository-level `core.excludesFile` no longer hide untracked files
+  from the fingerprint. `.gitignore` files and the user's global excludes file still apply, and
+  an untracked nested repository (a tool's worktree) stays out.
+- The diff scans run without external diff or textconv programs, with fixed `a/`/`b/` prefixes,
+  `--text`, `--no-relative` and literal pathspecs, from the top of the working tree, so diff
+  config and `-diff` attributes cannot empty them ([tripwires.py](./tripwires.py)).
+- The push guard checks every push URL (`remote get-url --push --all`), so a `pushurl` or
+  `pushInsteadOf` cannot send a push to a forge while the fetch URL looks local.
+
+### Fixed
+
+- An unreadable tree is reported as "evidence unavailable" instead of passing silently. A
+  repository readable at first sight but not at the claim used to be skipped, and a failed
+  `git status` used to read as a clean tree. A green run whose tree could not be read is
+  recorded as such ([__init__.py](./__init__.py)).
+- A repository git refuses to read (unknown format version or extension) no longer falls back
+  to the size-and-mtime directory fingerprint; the directory fingerprint also records ctime
+  and inode.
+- The fingerprint works from a working directory whose case differs from git's toplevel.
+- The test-diff scan works when the terminal sits in a subdirectory: root-relative names were
+  passed back as cwd-relative pathspecs.
+- The tree snapshot is logged even when the tree cannot be read.
+
+### Changed
+
+- A repository that used `.git/info/exclude` for files in its working tree gets a different
+  tree id once, and a file a test run writes that is excluded only there now makes evidence
+  stale. Move such rules to `.gitignore`.
+
 ## [0.6.1] - 2026-11-03
 
 ### Fixed

@@ -776,6 +776,10 @@ def _stale_test_evidence(
 
     When no run recorded a tree (not a git repository), the hook-visible edit timeline is the
     fallback. Prose-only changes are ignored throughout.
+
+    A tree that cannot be read (git failed or timed out) is never taken as unchanged: the
+    finding says the evidence is unavailable, and nothing about that repository counts as
+    verified. An agent that makes its tree unreadable gets no pass for it.
     """
     if not tripwires.claims_verification(text):
         return None
@@ -786,17 +790,21 @@ def _stale_test_evidence(
     roots = roots or {}
     newest_by_root: Dict[str, Dict[str, Any]] = {}
     for run in sorted(passes, key=lambda e: int(e.get("seq") or 0)):
-        if run.get("tree_root") and run.get("tree"):
+        if run.get("tree_root") and (run.get("tree") or run.get("tree_unavailable")):
             newest_by_root[str(run["tree_root"])] = run
     if newest_by_root or roots:
         problems: List[str] = []
+        unavailable: List[str] = []
         for root in sorted(set(newest_by_root) | set(roots)):
-            current = fingerprint(root)
             name = os.path.basename(root) or root
             run = newest_by_root.get(root)
+            if run is not None and not run.get("tree"):
+                unavailable.append(f"{name}: the passing run's tree could not be read")
+                continue
+            current = fingerprint(root)
             if run is not None:
                 if current is None:
-                    problems.append(f"{name}: the tree could not be read to compare")
+                    unavailable.append(f"{name}: the tree could not be read to compare")
                 elif current["hash"] != run["tree"]:
                     paths = ", ".join(str(p) for p in (current.get("paths") or [])[:4])
                     problems.append(
@@ -805,24 +813,40 @@ def _stale_test_evidence(
                     )
                 continue
             baseline = (roots.get(root) or {}).get("baseline")
-            if current is not None and baseline is not None and current["hash"] == baseline:
+            if current is None:
+                # Whether or not it was readable at first sight, an unreadable tree now is no
+                # evidence that it is unchanged.
+                unavailable.append(f"{name}: the tree could not be read, no passing run covers it")
                 continue
-            if current is None and baseline is not None:
+            if baseline is not None and current["hash"] == baseline:
                 continue
-            paths = ", ".join(str(p) for p in ((current or {}).get("paths") or [])[:4])
+            paths = ", ".join(str(p) for p in (current.get("paths") or [])[:4])
             problems.append(
                 f"{name}: changed in this session and no passing run covers it"
                 + (f" ({paths})" if paths else "")
             )
-        if not problems:
+        if not problems and not unavailable:
             # Edits whose repository is unknown (a relative path, no tracked directory) are
             # outside every tree compared above; the hook timeline still sees them.
             return _edit_timeline_stale(passes, events, only_unrooted=bool(newest_by_root))
+        if not problems:
+            return {
+                "category": "stale_test_evidence",
+                "severity": "high",
+                "claim": (
+                    "final answer claims tests pass, but the tree could not be read: "
+                    "evidence unavailable"
+                ),
+                "evidence": ("evidence unavailable: " + "; ".join(unavailable))[:300],
+                "evidence_unavailable": True,
+            }
         return {
             "category": "stale_test_evidence",
             "severity": "high",
             "claim": "final answer claims tests pass, but no passing run saw the current code",
-            "evidence": "; ".join(problems)[:300],
+            "evidence": "; ".join(
+                problems + [f"evidence unavailable: {item}" for item in unavailable]
+            )[:300],
         }
     return _edit_timeline_stale(passes, events)
 
@@ -1188,11 +1212,16 @@ def _pre_verify(
         # Ground truth at the moment the turn asks to finish: what the tree looks like,
         # whether or not any edit hook saw how it got that way.
         snapshot = evidence.snapshot(root_here, fingerprint(root_here))
-        if snapshot:
-            _log_check(
-                "tree_snapshot",
-                {"session_id": session_id, "repo": repo, "attempt": attempt, **snapshot},
-            )
+        _log_check(
+            "tree_snapshot",
+            {
+                "session_id": session_id,
+                "repo": repo,
+                "attempt": attempt,
+                # Recorded either way: a missing snapshot is itself something to see.
+                **(snapshot or {"tree": None, "evidence_unavailable": True}),
+            },
+        )
     claims = [
         c
         for c in (

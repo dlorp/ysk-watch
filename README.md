@@ -145,6 +145,25 @@ never clear them.
   current whatever happened in between, including `git add` and `git commit`; different name,
   it is stale, even when every edit went through `sed -i`, a script, or a subagent no edit hook
   saw. Prose files (`.md`, `.rst`, `.adoc`) are left out of both.
+- **The repository does not get a say.** The watched agent can write the repository's config
+  and index, so the fingerprint and the diff scans do not take their word:
+  - Settings that make git report less (`core.fsmonitor`, the untracked cache, `core.ignoreStat`,
+    `core.checkStat`, `core.trustctime`, `core.fileMode`) are overridden with git's defaults,
+    from the command line, which outranks every config file.
+  - Nothing the repository names is run: no filter driver (files are hashed raw), no hook
+    (file or config-defined), no external diff or textconv program, no transport or
+    promisor-remote fetch, no `git replace` substitution, and no git process inside a
+    submodule (submodules are compared by commit).
+  - Files marked assume-unchanged or skip-worktree are hashed from disk. A skip-worktree file
+    that is absent is treated as a sparse checkout.
+  - Only `.gitignore` files and your global excludes file hide an untracked file.
+    `.git/info/exclude` and a repository-level `core.excludesFile` do not: they are private,
+    unreviewed state. Put generated files in `.gitignore`.
+  - A repository whose config points git at another working tree, or that git refuses to read,
+    gets no fingerprint rather than a weaker one.
+- **Unreadable is not unchanged.** When a tree cannot be read (git fails or times out), the
+  claim is held with "evidence unavailable", never passed. That covers a green run whose tree
+  could not be read and a repository that could be read at first sight but not now.
 - **Per repository.** Every repository the session works in is tracked. Each one a green run
   covered must still have the tree that run saw; each one no green run covered must still have
   the tree it had when the session first went there. Tests run in a clean clone do not cover
@@ -419,6 +438,14 @@ against reviewed outcomes once there are enough of them.
   other command a later `cd` may not have run, so it is not followed. A terminal whose
   directory was never set by a `cd` has no git evidence, and the edit timeline applies.
 - Files ignored by `.gitignore` are not part of the fingerprint.
+- The fingerprint still takes object ids from the repository's index for paths git does not
+  report as changed, so an agent that rewrites `.git/index` by hand can hide an edit. Content
+  conversions named in attributes (`ident`, `eol`, `working-tree-encoding`) also apply when
+  a file is hashed. A nested repository or submodule counts by its commit id only, and an
+  untracked `.gitignore` can hide files next to it. The tree a run is credited with is read
+  after the test command, not before.
+- The diff scans compare against the current `HEAD`, take at most 20 paths, and find nothing
+  when git fails; the push guard resolves a push with no remote named against `origin`.
 - Outside git the fingerprint is size and modification time, not content: a `touch` reads as an
   edit, and an edit that restores both exactly does not. File types outside the source list
   (images, data files) are not part of it.

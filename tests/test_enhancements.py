@@ -1478,3 +1478,254 @@ def test_the_sweep_never_follows_a_symlink_or_removes_a_plain_file(ysk, tmp_path
     monkeypatch.setattr(ysk.evidence, "_last_sweep", 0.0)
     assert ysk.evidence._sweep_stale_temp_dirs() == 0
     assert (target / "objects" / "keep").exists() and link.is_symlink() and plain.exists()
+
+
+# --- evidence integrity: config and index state the watched repository controls -------------
+
+
+def _marker_script(tmp_path: Path, name: str, body: str) -> tuple:
+    """A shell script that leaves a marker file when it runs, then does ``body``."""
+    marker = tmp_path / f"{name}.ran"
+    script = tmp_path / f"{name}.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\n{body}\n")
+    script.chmod(0o755)
+    return script, marker
+
+
+def test_a_planted_clean_filter_neither_runs_nor_hides_an_edit(ysk, repo, tmp_path):
+    """A clean filter that prints the same bytes for every file would make any edit hash like
+    the original. The driver is turned off, so the raw file is hashed."""
+    script, marker = _marker_script(tmp_path, "clean", "cat >/dev/null\necho constant")
+    (repo / ".gitattributes").write_text("*.py filter=same\n")
+    _git(repo, "config", "filter.same.clean", str(script))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "attributes")
+    marker.unlink(missing_ok=True)
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert before and after and before["hash"] != after["hash"]
+    assert not marker.exists()
+
+
+def test_a_planted_fsmonitor_hook_is_not_run(ysk, repo, tmp_path):
+    """An fsmonitor hook answers git's "what changed?"; one that answers "nothing" hides edits."""
+    script, marker = _marker_script(tmp_path, "fsmonitor", "printf 'token\\0'")
+    _git(repo, "config", "core.fsmonitor", str(script))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    fingerprint = ysk.evidence.tree_fingerprint(str(repo))
+    assert fingerprint and "src/calc.py" in fingerprint["paths"]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("mark", ["--assume-unchanged", "--skip-worktree"])
+def test_an_edit_behind_an_index_mark_changes_the_fingerprint(ysk, repo, mark):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    _git(repo, "update-index", mark, "src/calc.py")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert _git(repo, "status", "--porcelain") == ""  # git itself no longer reports the edit
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after and after["hash"] != before["hash"]
+    assert "src/calc.py" in after["paths"]
+    # The same tree as the one git names once the mark is gone, and the real index keeps it.
+    assert "src/calc.py" in _git(repo, "ls-files", "-v")
+    _git(repo, "update-index", mark.replace("--", "--no-", 1), "src/calc.py")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == after["hash"]
+
+
+def test_marks_are_cleared_only_in_the_throwaway_index(ysk, repo):
+    _git(repo, "update-index", "--skip-worktree", "src/calc.py")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert ysk.evidence.tree_fingerprint(str(repo)) is not None
+    assert _git(repo, "ls-files", "-v", "src/calc.py").startswith("S ")
+
+
+def test_a_skip_worktree_file_absent_from_disk_is_a_sparse_checkout_not_a_deletion(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    _git(repo, "update-index", "--skip-worktree", "tests/test_calc.py")
+    (repo / "tests" / "test_calc.py").unlink()
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before["hash"]
+
+
+def test_a_file_hidden_by_info_exclude_changes_the_fingerprint(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("src/helper.py\n")
+    (repo / "src" / "helper.py").write_text("def add(a, b):\n    return 3\n")
+    assert "helper" not in _git(repo, "status", "--porcelain")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "src/helper.py" in after["paths"]
+
+
+def test_a_repository_level_excludes_file_does_not_hide_a_file(ysk, repo, tmp_path):
+    rules = tmp_path / "rules"
+    rules.write_text("helper.py\n")
+    _git(repo, "config", "core.excludesFile", str(rules))
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "src" / "helper.py").write_text("def add(a, b):\n    return 3\n")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "src/helper.py" in after["paths"]
+
+
+def test_gitignore_still_keeps_build_output_out_of_the_fingerprint(ysk, repo):
+    (repo / ".gitignore").write_text("build/\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "ignore")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "build").mkdir()
+    (repo / "build" / "out.py").write_text("X = 1\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before["hash"]
+
+
+def test_a_repository_pointing_git_at_another_worktree_has_no_fingerprint(ysk, repo, tmp_path):
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(repo, "config", "core.worktree", str(decoy))
+    assert ysk.evidence.tree_fingerprint(str(repo)) is None
+
+
+def test_a_failed_status_is_no_fingerprint_not_a_clean_tree(ysk, repo, monkeypatch):
+    real = ysk.evidence._run_git
+
+    def failing(directory, args, **kwargs):
+        if args and args[0] == "status":
+            return False, ""
+        return real(directory, args, **kwargs)
+
+    monkeypatch.setattr(ysk.evidence, "_run_git", failing)
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert ysk.evidence.tree_fingerprint(str(repo)) is None
+
+
+def test_the_hardened_config_comes_after_inherited_entries(ysk, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/bin/true")
+    env = ysk.evidence.hardened_env(extra=(("filter.a=b.clean", ""),))
+    count = int(env["GIT_CONFIG_COUNT"])
+    pairs = [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
+    assert pairs[0] == ("core.fsmonitor", "/bin/true")
+    assert pairs.index(("core.fsmonitor", "false")) > 0
+    assert pairs[-1] == ("filter.a=b.clean", "")
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+
+def test_a_planted_external_diff_is_not_run_by_the_diff_scan(ysk, repo, tmp_path):
+    script, marker = _marker_script(tmp_path, "extdiff", "exit 0")
+    _git(repo, "config", "diff.external", str(script))
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    findings = ysk.tripwires.scan_git_diff(["tests/test_calc.py"], str(repo))
+    assert not marker.exists()
+    assert any(f["category"] == "test_weakened" for f in findings)
+
+
+def test_a_green_run_on_an_unreadable_tree_is_reported_as_evidence_unavailable(
+    ysk, repo, monkeypatch
+):
+    monkeypatch.setattr(ysk.evidence, "tree_fingerprint", lambda *a, **k: None)
+    _terminal(ysk, f"cd {repo} && python -m pytest -q", "1 passed in 0.01s")
+    runs = [e for e in ysk._events("s1") if e.get("category") == "test_run"]
+    assert runs[-1].get("passed") is True and runs[-1].get("tree_unavailable") is True
+    out = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert out and "evidence unavailable" in out["message"]
+    snapshots = [c for c in _checks(ysk) if c.get("kind") == "tree_snapshot"]
+    assert snapshots and snapshots[-1].get("evidence_unavailable") is True
+
+
+def test_an_unreadable_tree_with_a_readable_baseline_is_not_taken_as_unchanged(ysk):
+    """Readable at first sight, unreadable now: no evidence the tree is unchanged."""
+    events = [{"category": "test_run", "passed": True, "seq": 1}]
+    roots = {"/x/proj": {"baseline": "abc123abc123"}}
+    claim = ysk._stale_test_evidence("All tests pass.", events, roots, lambda root: None)
+    assert claim and claim["severity"] == "high"
+    assert claim["evidence"].startswith("evidence unavailable: proj: the tree could not be read")
+
+
+def test_an_excluded_nested_repository_stays_out_of_the_fingerprint(ysk, repo):
+    """A tool's worktree under an info/exclude rule is a repository of its own, not content."""
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text(".claude/worktrees/\n")
+    nested = repo / ".claude" / "worktrees" / "wt"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True, capture_output=True)
+    (nested / "x.py").write_text("X = 1\n")
+    _git(nested, "add", "-A")
+    _git(nested, "commit", "-q", "-m", "nested")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before["hash"]
+
+
+def test_a_planted_hook_does_not_run_on_the_throwaway_index(ysk, repo, tmp_path):
+    marker = tmp_path / "hook.ran"
+    hook = repo / ".git" / "hooks" / "post-index-change"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    hook.chmod(0o755)
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    assert ysk.evidence.tree_fingerprint(str(repo)) is not None
+    assert not marker.exists()
+
+
+def test_a_trustctime_off_mtime_restored_edit_changes_the_fingerprint(ysk, repo):
+    calc = repo / "src" / "calc.py"
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    _git(repo, "config", "core.trustctime", "false")
+    stat = calc.stat()
+    time.sleep(1.1)
+    calc.write_text("def add(a, b):\n    return a - b\n")  # same size
+    os.utime(calc, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_mis_cased_directory_still_has_a_fingerprint(ysk, repo):
+    probe = repo.parent / repo.name.upper()
+    if not probe.exists():
+        pytest.skip("case-sensitive filesystem")
+    assert ysk.evidence.tree_fingerprint(str(probe)) is not None
+
+
+def test_a_repository_git_refuses_is_not_fingerprinted_as_a_plain_directory(ysk, repo):
+    _git(repo, "config", "core.repositoryformatversion", "99")
+    assert ysk.evidence.fingerprint(str(repo)) is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [("diff.mnemonicPrefix", "true"), ("diff.noprefix", "true"), ("diff.relative", "true")],
+)
+def test_diff_config_does_not_blind_the_test_diff_scan(ysk, repo, config):
+    _git(repo, "config", *config)
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    findings = ysk.tripwires.scan_git_diff(None, str(repo / "src"))
+    assert any(f["category"] == "test_weakened" for f in findings)
+
+
+def test_a_binary_attribute_does_not_blind_the_test_diff_scan(ysk, repo):
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("tests/** -diff\n")
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    findings = ysk.tripwires.scan_git_diff(None, str(repo))
+    assert any(f["category"] == "test_weakened" for f in findings)
+
+
+def test_config_defined_hooks_are_disabled_by_name(ysk, repo):
+    _git(repo, "config", "hook.evil.command", "touch /tmp/never")
+    _git(repo, "config", "hook.evil.event", "post-index-change")
+    overrides = dict(ysk.evidence.filter_overrides(str(repo)))
+    assert overrides["hook.evil.enabled"] == "false"
+    assert overrides["hook.evil.event"] == ""
+
+
+def test_inherited_dash_c_and_pathspec_switches_are_removed_from_every_env(ysk, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'core.fsmonitor'='/bin/evil'")
+    monkeypatch.setenv("GIT_ICASE_PATHSPECS", "1")
+    for env in (None, dict(os.environ)):
+        run_env = ysk.evidence.hardened_env(env)
+        assert "GIT_CONFIG_PARAMETERS" not in run_env
+        assert "GIT_ICASE_PATHSPECS" not in run_env
+        assert run_env["GIT_ALLOW_PROTOCOL"] == ""
