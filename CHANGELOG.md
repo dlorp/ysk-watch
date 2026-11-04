@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-04
+
+### Security
+
+- The fingerprint takes nothing from the repository's index but names. It reads every path in
+  HEAD, the index and the untracked listing from disk, hashes the raw bytes itself, and builds
+  the tree in a throwaway index. An index rewritten to call an edited file clean, or a
+  directory a submodule, no longer hides anything. Unchanged files are recognized by a stat
+  cache of the watcher's own under `$HERMES_HOME/cache/ysk-watch/stat/`, keyed on size,
+  mtime, ctime, inode and mode. A cache file that is not a plain, valid file is ignored
+  ([evidence.py](./evidence.py)).
+- No content conversion applies when hashing: eol, `ident` and `working-tree-encoding`
+  attributes could make different code hash like HEAD.
+- The untracked listing honours only `.gitignore` files. The global excludes file is now ignored
+  too: the agent can write it. A `.gitignore` that ignores itself counts as content, unless a
+  tool wrote it into a dot-directory or `build`/`dist` that holds nothing tracked or importable.
+- Submodules and repositories created inside the checkout are hashed file by file and folded
+  in; their own `.gitignore` and index hide nothing.
+- A green run is credited with the tree read just before its command, from a new `pre_tool_call`
+  hook (8 s budget, never blocks; parallel test calls share one reading). Reports the run
+  writes about itself do not count as a change. A command that can write the tree or steer the
+  run around its test step (redirections, scripts, `env`, substitution, `git -c`,
+  `PYTHONPATH`, `-p plugin`, background jobs), or whose earlier read failed, earns no tree
+  ([__init__.py](./__init__.py), [tripwires.py](./tripwires.py)).
+- The committed allowlist is read through the hardened git, so `git replace` cannot swap its
+  blob ([ysk_config.py](./ysk_config.py)).
+- The diff scans compare against the commit the session started from, read before its first
+  command, and read every changed path. A git failure, a vanished base commit or more than 400
+  changed paths is a high finding, not an empty diff.
+- The push guard resolves a bare push as git does: `pushRemote`, `pushDefault`, the remote's
+  `push` refspecs and `mirror`, and `push.default`. It also flags `--all`, `--mirror`, `:` and
+  glob refspecs, takes `--repo=`, follows `insteadOf` on a path, and treats `git -c` and
+  `GIT_CONFIG_*` on the push as a forge push.
+- git is run from a root-owned path when the one on `PATH` is writable by the watched user
+  (the Command Line Tools binary on macOS rather than the `/usr/bin` shim).
+- A code file that is a symlink to a prose file makes that file code.
+- A `.pyc` outside `__pycache__` is content: Python imports it with no source beside it.
+- The push guard no longer reads the value of `-o`/`--push-option`/`--receive-pack`/`--exec`
+  as the remote.
+
+### Fixed
+
+- Every fingerprint and diff scan in `pre_verify` and the final notice shares a 20 s budget.
+  Hermes abandons those hooks at 30 s and lets the answer through; a tree not read in time is
+  now "evidence unavailable".
+- A file missing from disk counts as deleted whatever the index marks say;
+  `core.sparseCheckout` is the agent's to set and excuses nothing.
+- Shell parsing: `2>&1`, `>&2` and `&>log` are redirections, not a background `&`.
+
+### Changed
+
+- Files checked out with converted line endings read as changed from HEAD (consistently, so
+  evidence is not affected). Tree ids are otherwise identical to 0.7.0.
+- A repository that relied on the global excludes file for generated files gets a different tree
+  id once. Move such rules to `.gitignore`.
+
 ## [0.7.0] - 2026-11-03
 
 ### Security
