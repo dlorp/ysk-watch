@@ -1,4 +1,4 @@
 # Pinned so CI changes only when this file does. Dependabot proposes updates weekly.
 pytest==9.1.1
 PyYAML==6.0.3
-ruff==0.17.1
+ruff==0.17.3
