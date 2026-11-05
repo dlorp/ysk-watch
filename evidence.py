@@ -139,6 +139,58 @@ def hardened_env(
     return run_env
 
 
+# Where a git someone else installed usually lives. On a host where ``git`` on PATH is a file the
+# watched agent's own user can rewrite (a wrapper script in ``/usr/local/bin``), every answer
+# the watcher gets from git would be the agent's to choose.
+# macOS's /usr/bin/git is a shim that looks the real binary up; the Command Line Tools copy
+# is the binary itself.
+_SYSTEM_GIT_DIRS = (
+    "/Library/Developer/CommandLineTools/usr/bin",
+    "/usr/bin",
+    "/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
+_git_binary_cache: Dict[str, Optional[str]] = {}
+
+
+def _owned_by_someone_else(path: str) -> bool:
+    """``path`` and every directory above it belong to root and only root can write them."""
+    here = os.path.realpath(path)
+    while True:
+        try:
+            info = os.stat(here)
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return True
+        here = parent
+
+
+def git_binary() -> Optional[str]:
+    """The git to run: the one on PATH when root owns it, else a root-owned system git.
+
+    ``None`` when there is no git on PATH at all (the directory fingerprint then applies). When
+    no root-owned git exists, the one on PATH is used: nothing better is available.
+    """
+    found = shutil.which("git")
+    if not found:
+        return None
+    if found not in _git_binary_cache:
+        choice = found
+        if not _owned_by_someone_else(found):
+            for directory in _SYSTEM_GIT_DIRS:
+                candidate = os.path.join(directory, "git")
+                if os.path.isfile(candidate) and _owned_by_someone_else(candidate):
+                    choice = candidate
+                    break
+        _git_binary_cache[found] = choice
+    return _git_binary_cache[found]
+
+
 def _run_git(
     directory: Optional[str],
     args: List[str],
@@ -152,7 +204,7 @@ def _run_git(
     run_env = hardened_env(env, extra_config)
     try:
         proc = subprocess.run(
-            ["git", "-C", here, *args],
+            [git_binary() or "git", "-C", here, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -236,7 +288,8 @@ def changed_paths(directory: Optional[str]) -> List[str]:
 
 
 # Never source, and rewritten by any Python or Node run: a repository that does not ignore
-# them must not see a green run go stale because ``python -c`` wrote a ``.pyc``.
+# them must not see a green run go stale because ``python -c`` wrote a ``.pyc``. A ``.pyc``
+# outside ``__pycache__`` is not a cache: Python imports it with no source beside it.
 _CACHE_NAMES = (
     "__pycache__",
     ".pytest_cache",
@@ -251,7 +304,7 @@ _CACHE_NAMES = (
     "htmlcov",
 )
 _CACHE_PATH_RE = re.compile(
-    r"(?:^|/)(?:" + "|".join(re.escape(name) for name in _CACHE_NAMES) + r")/|\.py[co]$|"
+    r"(?:^|/)(?:" + "|".join(re.escape(name) for name in _CACHE_NAMES) + r")/|"
     r"(?:^|/)\.coverage(?:\.[^/]*)?$|\.egg-info/"
 )
 _CACHE_PATHSPECS = [f":(exclude,glob)**/{name}/**" for name in _CACHE_NAMES] + [
@@ -315,60 +368,157 @@ def filter_overrides(root: str) -> Optional[Tuple[Tuple[str, str], ...]]:
     return tuple(overrides)
 
 
-def _global_excludes_file(root: str) -> Optional[str]:
-    """The user's own excludes file: ``core.excludesFile`` from the global config, else git's
-    default location. A repository-level setting is not consulted."""
-    ok, value = _run_git(root, ["config", "--global", "--path", "--get", "core.excludesFile"])
-    path = value.strip() if ok else ""
-    if not path:
-        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-        path = os.path.join(base, "git", "ignore")
-    return path if os.path.isfile(path) else None
+# Editor and OS droppings a global excludes file usually hides. That file is the agent's to
+# write too, so it is not read; these few names are excluded by the watcher itself.
+_JUNK_EXCLUDES = (
+    "--exclude=.DS_Store",
+    "--exclude=Thumbs.db",
+    "--exclude=*.swp",
+    "--exclude=*~",
+    "--exclude=.idea/",
+    "--exclude=.vscode/",
+    "--exclude=.direnv/",
+    "--exclude=/.claude/settings.local.json",
+)
+# Tool worktrees: repositories of their own that the session's tools create inside a checkout.
+_TOOL_WORKTREE_RE = re.compile(r"^(?:\.claude/worktrees|\.worktrees)/")
 
 
-def _hidden_paths(
-    root: str, extra_config: Tuple[Tuple[str, str], ...]
+def _untracked_paths(
+    root: str,
+    extra_config: Tuple[Tuple[str, str], ...],
+    env: Dict[str, str],
+    timeout: float = _STAGE_TIMEOUT_S,
 ) -> Optional[Tuple[List[str], List[str]]]:
-    """Paths ``git status`` can be told not to report, as ``(flagged, untracked)``.
+    """Untracked files and nested repositories, as ``(files, repositories)``.
 
-    ``flagged``: tracked files marked assume-unchanged or skip-worktree that exist on disk.
-    Status trusts the mark and never looks at them. A skip-worktree file that is absent is
-    an ordinary sparse checkout and is left alone.
+    Listed against ``env``'s index, a throwaway one read from HEAD: the repository's own index
+    could claim any directory is a submodule, and git never lists what is inside one. Only
+    ``.gitignore`` files hide a file. Not ``.git/info/exclude``, a repository-level
+    ``core.excludesFile`` or the user's global excludes file: all three are files the watched
+    agent can write without any tracked file changing. A nested repository is listed as
+    ``dir/``; tool worktrees (``.claude/worktrees/``) are left out.
 
-    ``untracked``: untracked files, honoring ``.gitignore`` files and the user's global
-    excludes file but not ``.git/info/exclude`` or a repository-level ``core.excludesFile``.
-    Those two live in the repository's private, unreviewed state, so a rule there could hide
-    a new source file without any tracked file changing. An untracked nested repository
-    (listed as ``dir/``, such as a tool's worktree under ``.claude/worktrees/``) is left out:
-    git would record only its commit id, and it is a repository of its own, fingerprinted on
-    its own when the session works there.
-
-    ``None`` when either listing fails: a partial list would name a tree that does not exist.
+    ``None`` when the listing fails: a partial list would name a tree that does not exist.
     """
-    ok, raw = _run_git(root, ["ls-files", "-v", "-z"], timeout=_STAGE_TIMEOUT_S)
+    args = ["ls-files", "-z", "--others", "--exclude-per-directory=.gitignore", *_JUNK_EXCLUDES]
+    ok, raw = _run_git(root, args, env=env, timeout=timeout, extra_config=extra_config)
     if not ok:
         return None
-    flagged: List[str] = []
+    files: List[str] = []
+    repos: List[str] = []
+    for path in raw.split("\0"):
+        if not path:
+            continue
+        if path.endswith("/"):
+            if not _TOOL_WORKTREE_RE.match(path) and not _CACHE_PATH_RE.search(path):
+                repos.append(path.rstrip("/"))
+        else:
+            files.append(path)
+    return files, repos
+
+
+def _ignored_gitignores(
+    root: str,
+    extra_config: Tuple[Tuple[str, str], ...],
+    env: Dict[str, str],
+    timeout: float = _STAGE_TIMEOUT_S,
+) -> Optional[List[str]]:
+    """Untracked ``.gitignore`` files that are themselves ignored, caches aside.
+
+    A ``.gitignore`` whose own rules match it (``*``) hides itself along with the files it
+    was planted to hide, so the untracked listing names neither. Counting the file itself
+    is enough: creating or changing one after a green run changes the fingerprint.
+    """
+    args = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-per-directory=.gitignore",
+        "--",
+        ":(glob)**/.gitignore",
+        *_CACHE_PATHSPECS,
+    ]
+    ok, raw = _run_git(root, args, env=env, timeout=timeout, extra_config=extra_config)
+    if not ok:
+        return None
+    return [path for path in raw.split("\0") if path and not _CACHE_PATH_RE.search(path)]
+
+
+# A self-ignoring .gitignore in one of these, beside nothing tracked and nothing importable, is
+# a tool marking its own output. pytest skips them when collecting.
+_TOOL_DIR_NAMES = frozenset({"build", "dist"})
+_IMPORTABLE_RE = re.compile(r"(?:\.(?:py|pth|pyi|js|mjs|cjs|ts|tsx)|^conftest\.py)$")
+
+
+def _tool_owned(root: str, path: str, tracked_dirs: "set[str]") -> bool:
+    """A self-ignoring ``.gitignore`` a tool wrote into a directory of its own.
+
+    Caches and runtimes mark themselves this way (``.cache/``, a Python runtime's
+    ``generation-*/``). Such a file sits under a dot-directory or ``build``/``dist``, nothing
+    tracked lives in that directory, and nothing beside it could be imported. One planted
+    next to source, or beside a ``conftest.py``, still counts.
+    """
+    parent = os.path.dirname(path)
+    if not parent or parent in tracked_dirs:
+        return False
+    parts = parent.split("/")
+    if not any(part.startswith(".") or part.lower() in _TOOL_DIR_NAMES for part in parts):
+        return False
+    seen = 0
+    for _, _, files in os.walk(os.path.join(root, parent)):
+        for name in files:
+            seen += 1
+            if _IMPORTABLE_RE.search(name) or seen > 5000:
+                return False
+    return True
+
+
+def _head_entries(
+    root: str, extra_config: Tuple[Tuple[str, str], ...], timeout: float = _STAGE_TIMEOUT_S
+) -> Optional[Dict[str, Tuple[str, str]]]:
+    """``path -> (mode, object id)`` for every entry of HEAD's tree."""
+    ok, raw = _run_git(
+        root,
+        ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+        timeout=timeout,
+        extra_config=extra_config,
+    )
+    if not ok:
+        return None
+    entries: Dict[str, Tuple[str, str]] = {}
+    for entry in raw.split("\0"):
+        meta, _, path = entry.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and path:
+            entries[path] = (parts[0], parts[2])
+    return entries
+
+
+def _index_entries(
+    root: str, extra_config: Tuple[Tuple[str, str], ...], timeout: float = _STAGE_TIMEOUT_S
+) -> Optional[Dict[str, Tuple[str, str, str]]]:
+    """``path -> (mode, object id, tag)`` from the repository's own index.
+
+    Only the names, modes and the skip-worktree tag are used: the index is the watched
+    agent's to rewrite, so its object ids and stat data never decide what a file contains.
+    """
+    ok, raw = _run_git(
+        root, ["ls-files", "-s", "-v", "-z"], timeout=timeout, extra_config=extra_config
+    )
+    if not ok:
+        return None
+    entries: Dict[str, Tuple[str, str, str]] = {}
     for entry in raw.split("\0"):
         if len(entry) < 3:
             continue
-        tag, path = entry[0], entry[2:]
-        # ``m`` is an unmerged entry: status reports it already, and update-index cannot
-        # clear a mark on it.
-        if (
-            tag != "m"
-            and (tag.islower() or tag == "S")
-            and os.path.lexists(os.path.join(root, path))
-        ):
-            flagged.append(path)
-    args = ["ls-files", "-z", "--others", "--exclude-per-directory=.gitignore"]
-    excludes = _global_excludes_file(root)
-    if excludes:
-        args.append(f"--exclude-from={excludes}")
-    ok, raw = _run_git(root, args, timeout=_STAGE_TIMEOUT_S, extra_config=extra_config)
-    if not ok:
-        return None
-    return flagged, [path for path in raw.split("\0") if path and not path.endswith("/")]
+        tag = entry[0]
+        meta, _, path = entry[2:].partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and path:
+            entries[path] = (parts[0], parts[1], tag)
+    return entries
 
 
 def _within(directory: Optional[str], root: str) -> bool:
@@ -392,6 +542,27 @@ def _within(directory: Optional[str], root: str) -> bool:
         here = parent
 
 
+_STAT_CACHE_MAX_AGE_S = 30 * 86400.0
+
+
+def _prune_stat_caches(now: float) -> None:
+    """Remove stat caches untouched for a month (repositories and worktrees long gone)."""
+    try:
+        entries = list(os.scandir(_cache_dir()))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if (
+                entry.name.endswith(".json")
+                and entry.is_file(follow_symlinks=False)
+                and now - entry.stat(follow_symlinks=False).st_mtime > _STAT_CACHE_MAX_AGE_S
+            ):
+                os.unlink(entry.path)
+        except OSError:
+            continue
+
+
 def _sweep_stale_temp_dirs(now: Optional[float] = None) -> int:
     """Remove fingerprint temp directories that killed runs left behind; return the count.
 
@@ -404,6 +575,7 @@ def _sweep_stale_temp_dirs(now: Optional[float] = None) -> int:
     if now - _last_sweep < _SWEEP_INTERVAL_S:
         return 0
     _last_sweep = now
+    _prune_stat_caches(now)
     # Without fd-based rmtree a directory swapped for a symlink between the checks below and the
     # removal could redirect it; leave the leftovers rather than risk that.
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
@@ -435,151 +607,555 @@ def _sweep_stale_temp_dirs(now: Optional[float] = None) -> int:
     return removed
 
 
+# --- the watcher's own stat cache -------------------------------------------------------------
+# The repository's index records, per file, an object id and the stat data it was hashed at.
+# It is the watched agent's to rewrite: an index that pairs an edited file's current stat
+# data with the old object id would make git report the file clean and the tree keep its
+# old name. The fingerprint therefore never takes content from the index. It hashes files
+# itself, raw (no filter, eol, ident or encoding conversion), and remembers what it hashed in
+# a cache of its own, keyed on size, mtime, ctime, inode and mode. ctime cannot be set back by
+# hand, so an edit that restores mtime and size still misses the cache. The cache lives under
+# ``$HERMES_HOME`` with the watcher's other files (see the README's trust note).
+
+_STAT_CACHE_VERSION = 2
+# A file changed within this window of being hashed could change again inside the same
+# timestamp tick; it is hashed again next time rather than remembered.
+_RACY_NS = 2_000_000_000
+_HASH_CHUNK = 1 << 20
+_MAX_CACHE_BYTES = 64 * 1024 * 1024
+_OBJECT_FORMATS = {"sha1": 40, "sha256": 64}
+_MODES = frozenset({"100644", "100755", "120000"})
+_cache_dir_provider: Optional[Any] = None
+
+
+def set_cache_dir_provider(provider: Any) -> None:
+    """Let the plugin place the stat cache under ``$HERMES_HOME`` (a callable returning a path)."""
+    global _cache_dir_provider
+    _cache_dir_provider = provider
+
+
+def _cache_dir() -> str:
+    """``YSK_WATCH_CACHE_DIR``, else the plugin's directory, else ``$XDG_CACHE_HOME/ysk-watch``."""
+    override = os.environ.get("YSK_WATCH_CACHE_DIR")
+    if override:
+        return override
+    if _cache_dir_provider is not None:
+        try:
+            return str(_cache_dir_provider())
+        except Exception:
+            pass
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "ysk-watch", "stat")
+
+
+def _stat_cache_path(git_dir: str) -> str:
+    key = hashlib.sha256(os.path.realpath(git_dir).encode("utf-8", "surrogateescape"))
+    return os.path.join(_cache_dir(), key.hexdigest()[:24] + ".json")
+
+
+def _valid_cache_entry(entry: Any) -> bool:
+    if not isinstance(entry, list) or len(entry) != 7:
+        return False
+    size, mtime, ctime, ino, mode, algo, oid = entry
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (size, mtime, ctime, ino)):
+        return False
+    width = _OBJECT_FORMATS.get(algo) if isinstance(algo, str) else None
+    return (
+        mode in _MODES
+        and width is not None
+        and isinstance(oid, str)
+        and re.fullmatch(f"[0-9a-f]{{{width}}}", oid) is not None
+    )
+
+
+def _load_stat_cache(path: str) -> Dict[str, List[Any]]:
+    """Read a cache file: a regular file only, size-capped, every entry validated.
+
+    Anything else (a FIFO, a symlink, a huge or deeply nested document, a malformed entry) is
+    an empty cache: the files are hashed again, which is slower and always correct.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return {}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CACHE_BYTES:
+            return {}
+        chunks = []
+        while True:
+            chunk = os.read(fd, _HASH_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, ValueError, RecursionError, MemoryError):
+        return {}
+    finally:
+        os.close(fd)
+    if not isinstance(data, dict) or data.get("v") != _STAT_CACHE_VERSION:
+        return {}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return {k: v for k, v in entries.items() if isinstance(k, str) and _valid_cache_entry(v)}
+
+
+def _save_stat_cache(path: str, entries: Dict[str, List[Any]]) -> None:
+    """Write the cache atomically; a failed write only costs a rehash next time."""
+    directory = os.path.dirname(path)
+    tmp = ""
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".stat-", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"v": _STAT_CACHE_VERSION, "entries": entries}, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+        tmp = ""
+    except (OSError, ValueError):
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _blob_id(data: bytes, algo: str) -> str:
+    digest = hashlib.new(algo)
+    digest.update(b"blob %d\0" % len(data))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def _hash_file(
+    path: str, info: os.stat_result, algo: str, deadline: Optional[float] = None
+) -> Optional[str]:
+    """The blob id of a regular file's raw bytes; ``None`` if it changed while being read or
+    the deadline passed."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            info.st_dev,
+            info.st_ino,
+        ):
+            return None
+        digest = hashlib.new(algo)
+        digest.update(b"blob %d\0" % info.st_size)
+        total = 0
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                return None
+            chunk = os.read(fd, _HASH_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+        if total != info.st_size or os.fstat(fd).st_mtime_ns != info.st_mtime_ns:
+            return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _hash_symlink(path: str, algo: str) -> Optional[str]:
+    """A symlink's blob is its target text, as git stores it."""
+    try:
+        target = os.fsencode(os.readlink(path))
+    except OSError:
+        return None
+    return _blob_id(target, algo)
+
+
+def _remaining(deadline: Optional[float], default: float) -> float:
+    """A per-call timeout that does not outrun the overall deadline."""
+    if deadline is None:
+        return default
+    return max(0.5, min(default, deadline - time.monotonic()))
+
+
+def _plain_dir_digest(
+    path: str,
+    algo: str,
+    deadline: Optional[float],
+    cache: Optional[Dict[str, List[Any]]] = None,
+    fresh: Optional[Dict[str, List[Any]]] = None,
+    prefix: str = "",
+) -> Optional[str]:
+    """Content of a directory as one digest, every file in it; ``""`` when empty.
+
+    Used for submodules and repositories inside the checkout: their own ``.gitignore`` and
+    index are theirs to write, so nothing in them is consulted. Files are hashed raw (through
+    the outer stat cache, keyed ``prefix/relative``); caches and ``.git`` are skipped and
+    symlinked directories are hashed as links, not followed.
+    """
+    now_ns = time.time_ns()
+    lines: List[str] = []
+    for current, dirs, files in os.walk(path):
+        # A symlinked directory is not followed (os.walk would skip it silently): its target
+        # text is hashed like a symlinked file's, so retargeting it changes the digest.
+        links = [d for d in dirs if os.path.islink(os.path.join(current, d))]
+        dirs[:] = sorted(
+            d for d in dirs if d not in _CACHE_NAMES and d != ".git" and d not in links
+        )
+        for name in sorted([*files, *links]):
+            if deadline is not None and time.monotonic() > deadline:
+                return None
+            full = os.path.join(current, name)
+            try:
+                info = os.lstat(full)
+            except OSError:
+                return None
+            relative = os.path.relpath(full, path)
+            if stat.S_ISLNK(info.st_mode):
+                mode = "120000"
+            elif stat.S_ISREG(info.st_mode):
+                mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+            else:
+                continue
+            key = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, mode, algo]
+            cached = (cache or {}).get(prefix + relative)
+            if cached is not None and cached[:6] == key:
+                oid = cached[6]
+            elif mode == "120000":
+                oid = _hash_symlink(full, algo)
+            else:
+                oid = _hash_file(full, info, algo, deadline)
+            if oid is None:
+                return None
+            if fresh is not None and now_ns - info.st_mtime_ns > _RACY_NS:
+                if now_ns - info.st_ctime_ns > _RACY_NS:
+                    fresh[prefix + relative] = key + [oid]
+            lines.append(f"{relative}\0{info.st_mode & 0o170777:o}\0{oid}")
+    if not lines:
+        return ""
+    return "p" + hashlib.sha256("\n".join(lines).encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _nested_entry(
+    path: str,
+    recorded: str,
+    algo: str,
+    deadline: Optional[float],
+    cache: Dict[str, List[Any]],
+    fresh: Dict[str, List[Any]],
+    prefix: str,
+) -> Optional[Tuple[str, str]]:
+    """``(commit, content digest)`` for a repository inside the working tree.
+
+    A submodule, or an untracked repository someone created in the checkout, is code the
+    tests can import, and an uncommitted edit in it changes nothing the outer repository
+    records. Its files are all hashed (``_plain_dir_digest``) and the digest is folded into
+    the outer name; its own ``.gitignore`` hides nothing. The commit is its HEAD when it has
+    one, else the one the outer tree records.
+    """
+    head = ""
+    if os.path.lexists(os.path.join(path, ".git")):
+        toplevel = git(path, ["rev-parse", "--show-toplevel"]).strip()
+        if toplevel and os.path.realpath(toplevel) == os.path.realpath(path):
+            head = git(path, ["rev-parse", "--verify", "-q", "HEAD"]).strip()
+    digest = _plain_dir_digest(path, algo, deadline, cache, fresh, prefix)
+    if digest is None:
+        return None
+    return (head or recorded), digest
+
+
+def _hash_linked_docs(
+    root: str, entries: Dict[str, Tuple[str, str]], algo: str, deadline: Optional[float]
+) -> bool:
+    """A code path that is a symlink to a prose file makes that file code.
+
+    Prose keeps its HEAD version in the fingerprint; through a symlink, its current bytes are
+    what gets imported, so they are hashed. ``False`` when such a file cannot be read.
+    """
+    for path, (mode, _) in list(entries.items()):
+        if mode != "120000" or is_doc(path):
+            continue
+        try:
+            link = os.readlink(os.path.join(root, path))
+        except OSError:
+            continue
+        target = os.path.normpath(os.path.join(os.path.dirname(path), link))
+        if os.path.isabs(link) or target.startswith("..") or not is_doc(target):
+            continue
+        full = os.path.join(root, target)
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        oid = _hash_file(full, info, algo, deadline)
+        if oid is None:
+            return False
+        entries[target] = ("100755" if info.st_mode & stat.S_IXUSR else "100644", oid)
+    return True
+
+
 def tree_fingerprint(
-    directory: Optional[str], *, include_docs: bool = False
+    directory: Optional[str],
+    *,
+    include_docs: bool = False,
+    deadline: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """The git tree id of the working tree as it is on disk, docs excluded.
 
-    The whole working tree (tracked changes and untracked, non-ignored files) is staged into
-    a throwaway index whose new objects go to a throwaway object directory, and the tree id
-    of that index is the fingerprint. Files marked assume-unchanged or skip-worktree are
-    hashed from disk all the same, ``.git/info/exclude`` does not hide a file, and no filter
-    driver, fsmonitor hook or index cache the repository configures is used (see
-    ``_hidden_paths`` and ``filter_overrides``). The repository's own index and object store
-    are only read. The name therefore depends on file contents and nothing else: ``git add`` and
-    ``git commit`` after a green run leave it unchanged, while any content change, however
-    it was made, changes it. Nothing is truncated and no file is named by size or mtime.
+    Every path in HEAD, in the index and untracked (non-ignored) is looked at on disk and
+    its content hashed raw: no filter driver, eol, ident or encoding conversion, fsmonitor or
+    index stat cache the repository configures is used, and assume-unchanged and skip-worktree
+    marks do not hide a file. The untracked listing is taken against a throwaway index read
+    from HEAD, so an index that calls a directory a submodule hides nothing in it. Only
+    ``.gitignore`` files hide an untracked file; one that ignores itself counts as content.
+    The entries go into a throwaway index whose tree is written to a throwaway object
+    directory, and that tree id is the fingerprint. The repository's own index and object
+    store are only read. Unchanged files are recognized by the watcher's own stat cache.
 
-    Prose files (``.md``, ``.rst``, ``.adoc``) are reset to their HEAD version first, so a
-    README edit after a green run is not stale evidence.
+    The name depends on file contents and nothing else: ``git add`` and ``git commit`` after
+    a green run leave it unchanged, while any content change, however it was made, changes
+    it. Prose files (``.md``, ``.rst``, ``.adoc``) keep their HEAD version, so a README edit
+    after a green run is not stale evidence. Submodules and nested repositories fold in their
+    own fingerprints. A file checked out with converted line endings differs from its HEAD
+    blob, consistently: it is reported as changed, and it never hides a later edit.
+
+    ``deadline`` (a ``time.monotonic()`` value) bounds the whole call. Files hashed before it
+    passes are remembered, so a large first fingerprint finishes over several calls.
 
     Returns ``None`` outside a repository, before the first commit, when the repository's
-    config points git at another working tree, or when git fails or times out. Callers
+    config points git at another working tree, when git fails, or at the deadline. Callers
     decide what an unknown tree means; this function never guesses.
     """
     root = repo_root(directory)
     if not root or not _within(directory, root):
         return None
     head = git(root, ["rev-parse", "HEAD"]).strip()
-    if not head:
-        return None
-    index_path = _git_path(root, "index")
+    git_dir = git(root, ["rev-parse", "--absolute-git-dir"]).strip()
     objects_path = _git_path(root, "objects")
-    if not objects_path:
+    if not head or not git_dir or not objects_path:
+        return None
+    algo = git(root, ["rev-parse", "--show-object-format"]).strip() or "sha1"
+    if algo not in _OBJECT_FORMATS:
         return None
     filters = filter_overrides(root)
     if filters is None:
         return None
-    status = _status_paths(
-        root, include_sources=True, extra_config=filters, timeout=_STAGE_TIMEOUT_S
-    )
-    if status is None:
+    head_entries = _head_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S))
+    index_entries = _index_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S))
+    if head_entries is None or index_entries is None:
         return None
-    hidden = _hidden_paths(root, filters)
-    if hidden is None:
-        return None
-    flagged, untracked = hidden
-    listed: List[str] = []
-    seen = set()
-    for path in (
-        *status,
-        *flagged,
-        *untracked,
-    ):
-        if path not in seen:
-            seen.add(path)
-            listed.append(path)
-    paths = [path for path in listed if not _CACHE_PATH_RE.search(path)]
-    flagged = [path for path in flagged if path in paths]
-    docs = [path for path in paths if is_doc(path)] if not include_docs else []
-    code_paths = [path for path in paths if path not in docs]
     try:
         _sweep_stale_temp_dirs()
         with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
-            temp_index = os.path.join(tmp, "index")
-            temp_objects = os.path.join(tmp, "objects")
-            os.mkdir(temp_objects)
-            env = dict(os.environ)
-            env.update(
-                GIT_INDEX_FILE=temp_index,
-                GIT_OBJECT_DIRECTORY=temp_objects,
-                GIT_ALTERNATE_OBJECT_DIRECTORIES=objects_path,
+            return _fingerprint_in(
+                tmp,
+                root,
+                head,
+                git_dir,
+                objects_path,
+                algo,
+                filters,
+                head_entries,
+                index_entries,
+                include_docs,
+                deadline,
             )
-            env.pop("GIT_DIR", None)
-            env.pop("GIT_WORK_TREE", None)
-            copied = False
-            if index_path and os.path.isfile(index_path):
-                try:
-                    # The real index carries stat data, so unchanged files are not rehashed.
-                    # copy2 keeps the index file's mtime: git's racy-clean check compares
-                    # entries against it, and a fresh mtime would make a same-size edit made
-                    # within the same second as the last index write look unchanged.
-                    shutil.copy2(index_path, temp_index)
-                    copied = True
-                except OSError:
-                    copied = False
-            if not copied:
-                ok, _ = _run_git(root, ["read-tree", "HEAD"], env=env, extra_config=filters)
-                if not ok:
-                    return None
-            elif flagged:
-                # The copied index still carries the marks, and ``update-index`` leaves a
-                # skip-worktree entry alone even when it is named. Clear them in the copy.
-                for mark in ("--no-assume-unchanged", "--no-skip-worktree"):
-                    ok, _ = _run_git(
-                        root,
-                        ["update-index", mark, "-z", "--stdin"],
-                        env=env,
-                        timeout=_STAGE_TIMEOUT_S,
-                        input="".join(path + "\0" for path in flagged),
-                        extra_config=filters,
-                    )
-                    if not ok:
-                        return None
-            # Each changed path's object id goes into the throwaway index without the object
-            # being written (``--info-only``): the tree id is the one ``git add -A`` would
-            # produce, but no file content is copied into the temp directory, so a large
-            # untracked file costs one read rather than its size on disk. Filter drivers are
-            # off (``filter_overrides``): the raw file is hashed.
-            # One process reads every path from stdin: a single index write and a single
-            # timeout however many paths changed.
-            if paths:
-                ok, _ = _run_git(
-                    root,
-                    ["update-index", "--add", "--remove", "--info-only", "-z", "--stdin"],
-                    env=env,
-                    timeout=_STAGE_TIMEOUT_S,
-                    input="".join(path.rstrip("/") + "\0" for path in paths),
-                    extra_config=filters,
-                )
-                if not ok:
-                    return None
-            for start in range(0, len(docs), _PATHSPEC_CHUNK):
-                chunk = docs[start : start + _PATHSPEC_CHUNK]
-                ok, _ = _run_git(
-                    root,
-                    ["reset", "-q", "HEAD", "--", *[f":(literal){p}" for p in chunk]],
-                    env=env,
-                    extra_config=filters,
-                )
-                if not ok:
-                    return None
-            # The blobs hashed above were never written; trees are, and they are small.
-            # write-tree re-hashes a racily clean entry (one written in the same second as
-            # the index), so the filter overrides apply here too, as to every call above.
-            ok, tree = _run_git(root, ["write-tree", "--missing-ok"], env=env, extra_config=filters)
-            tree = tree.strip()
-            if not ok or not tree:
-                return None
     except OSError:
         return None
+
+
+def _fingerprint_in(
+    tmp: str,
+    root: str,
+    head: str,
+    git_dir: str,
+    objects_path: str,
+    algo: str,
+    filters: Tuple[Tuple[str, str], ...],
+    head_entries: Dict[str, Tuple[str, str]],
+    index_entries: Dict[str, Tuple[str, str, str]],
+    include_docs: bool,
+    deadline: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """``tree_fingerprint``'s work, with ``tmp`` as the scratch directory."""
+    temp_objects = os.path.join(tmp, "objects")
+    os.mkdir(temp_objects)
+    base_env = dict(os.environ)
+    base_env.pop("GIT_DIR", None)
+    base_env.pop("GIT_WORK_TREE", None)
+    head_env = dict(base_env, GIT_INDEX_FILE=os.path.join(tmp, "head-index"))
+    ok, _ = _run_git(
+        root,
+        ["read-tree", "HEAD"],
+        env=head_env,
+        timeout=_remaining(deadline, _STAGE_TIMEOUT_S),
+        extra_config=filters,
+    )
+    if not ok:
+        return None
+    listed = _untracked_paths(root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S))
+    gitignores = _ignored_gitignores(
+        root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S)
+    )
+    if listed is None or gitignores is None:
+        return None
+    untracked, nested_repos = listed
+    tracked_dirs = set()
+    for path in head_entries:
+        parent = os.path.dirname(path)
+        while parent and parent not in tracked_dirs:
+            tracked_dirs.add(parent)
+            parent = os.path.dirname(parent)
+    gitignores = [path for path in gitignores if not _tool_owned(root, path, tracked_dirs)]
+
+    # Index names are candidates too (a file staged and then hidden), but never a gitlink the
+    # index alone records: that directory's files come from the HEAD-index listing above.
+    index_names = [path for path, (mode, _, _) in index_entries.items() if mode != "160000"]
+    candidates: Dict[str, None] = {}
+    for path in (*head_entries, *index_names, *untracked, *gitignores):
+        candidates.setdefault(path, None)
+    cache_path = _stat_cache_path(git_dir)
+    cache = _load_stat_cache(cache_path)
+    fresh: Dict[str, List[Any]] = {}
+    entries: Dict[str, Tuple[str, str]] = {}
+    nested: List[Tuple[str, str]] = []
+    now_ns = time.time_ns()
+
+    def give_up() -> None:
+        # Keep what was hashed so the next call does not start over.
+        if fresh:
+            _save_stat_cache(cache_path, {**cache, **fresh})
+
+    real_root = os.path.realpath(root)
+    for path in candidates:
+        if _CACHE_PATH_RE.search(path):
+            continue
+        if deadline is not None and time.monotonic() > deadline:
+            give_up()
+            return None
+        parent = os.path.dirname(path)
+        if parent and os.path.realpath(os.path.join(root, parent)) != os.path.join(
+            real_root, parent
+        ):
+            # An ancestor is a symlink (a directory replaced by a link): the link itself is the
+            # entry, as with ``git add -A``; what it points at is outside this tree.
+            continue
+        if not include_docs and is_doc(path):
+            if path in head_entries:
+                entries[path] = head_entries[path]
+            continue
+        recorded_head = head_entries.get(path)
+        full = os.path.join(root, path)
+        try:
+            info = os.lstat(full)
+        except OSError:
+            # Absent: deleted, whatever the index marks say. (A sparse checkout reads as
+            # deleted files, the same way every time; ``core.sparseCheckout`` is the agent's to
+            # set, so it cannot excuse a deletion.)
+            continue
+        if recorded_head and recorded_head[0] == "160000" and stat.S_ISDIR(info.st_mode):
+            sub = _nested_entry(full, recorded_head[1], algo, deadline, cache, fresh, path + "/")
+            if sub is None:
+                give_up()
+                return None
+            entries[path] = ("160000", sub[0])
+            if sub[1]:
+                nested.append((path, sub[1]))
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            mode = "120000"
+        elif stat.S_ISREG(info.st_mode):
+            mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+        else:
+            continue  # a directory where a file was (its files are untracked), or a device
+        key = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, mode, algo]
+        cached = cache.get(path)
+        if cached is not None and cached[:6] == key:
+            oid = cached[6]
+        else:
+            if mode == "120000":
+                oid = _hash_symlink(full, algo)
+            else:
+                oid = _hash_file(full, info, algo, deadline)
+            if oid is None:
+                give_up()
+                return None
+        entries[path] = (mode, oid)
+        if now_ns - info.st_mtime_ns > _RACY_NS and now_ns - info.st_ctime_ns > _RACY_NS:
+            fresh[path] = key + [oid]
+    for path in nested_repos:
+        # An untracked repository inside the checkout: importable code, not committed here.
+        sub = _nested_entry(os.path.join(root, path), "", algo, deadline, cache, fresh, path + "/")
+        if sub is None:
+            give_up()
+            return None
+        if sub[1]:
+            nested.append((path + "/", sub[1]))
+    if not include_docs and not _hash_linked_docs(root, entries, algo, deadline):
+        give_up()
+        return None
+    if fresh != cache:
+        _save_stat_cache(cache_path, fresh)
+
+    env = dict(
+        base_env,
+        GIT_INDEX_FILE=os.path.join(tmp, "index"),
+        GIT_OBJECT_DIRECTORY=temp_objects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES=objects_path,
+    )
+    # Every entry by mode and object id: git hashes nothing here. The blobs were never
+    # written; ``--missing-ok`` lets the tree name them anyway.
+    info_lines = "".join(f"{mode} {oid}\t{path}\0" for path, (mode, oid) in sorted(entries.items()))
+    ok, _ = _run_git(
+        root,
+        ["update-index", "-z", "--index-info"],
+        env=env,
+        timeout=_remaining(deadline, _STAGE_TIMEOUT_S),
+        input=info_lines,
+        extra_config=filters,
+    )
+    if not ok:
+        return None
+    ok, tree = _run_git(
+        root,
+        ["write-tree", "--missing-ok"],
+        env=env,
+        timeout=_remaining(deadline, _GIT_TIMEOUT_S),
+        extra_config=filters,
+    )
+    tree = tree.strip()
+    if not ok or not tree:
+        return None
+
+    changes = {
+        path: (entries[path][1] if path in entries else "", path in head_entries)
+        for path in {**head_entries, **entries}
+        if entries.get(path) != head_entries.get(path)
+    }
+    changed = sorted(path for path in changes if include_docs or not is_doc(path))
+    changed += sorted(path for path, _ in nested if path.endswith("/"))
+    name = tree[:12]
+    if nested:
+        folded = tree + "".join(f"\n{path}\0{inner}" for path, inner in sorted(nested))
+        name = "s" + hashlib.sha256(folded.encode("utf-8", "surrogateescape")).hexdigest()[:11]
     return {
-        "hash": tree[:12],
+        "hash": name,
         "tree": tree,
         "head": head[:7],
+        "head_full": head,
         "root": root,
-        "paths": code_paths[:20],
-        "count": len(code_paths),
+        "paths": changed[:20],
+        "count": len(changed),
+        # path -> (object id, or "" when deleted; whether HEAD has it), for every path that
+        # differs from HEAD. Lets a caller tell what changed between two readings.
+        "changes": changes,
     }
 
 
@@ -683,12 +1259,14 @@ def dir_fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
     }
 
 
-def fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
+def fingerprint(
+    directory: Optional[str], *, deadline: Optional[float] = None
+) -> Optional[Dict[str, Any]]:
     """The git tree fingerprint inside a repository, the directory fingerprint outside one."""
     if not directory:
         return None
     if repo_root(directory):
-        return tree_fingerprint(directory)
+        return tree_fingerprint(directory, deadline=deadline)
     if shutil.which("git") and _inside_git_metadata_tree(directory):
         # A repository git refuses to read (an unknown format version or extension, a
         # planted ``core.bare``) is not a plain directory: no weaker name stands in for it.
@@ -717,7 +1295,8 @@ def snapshot(
     ``git diff --stat`` and ``git status`` recorded together, so a finding about a claim can
     be read back against the tree that was current when the claim was made.
     """
-    fingerprint = fingerprint or tree_fingerprint(directory)
+    # Never a second fingerprint here: the caller's ran under a deadline, and an unread tree
+    # stays unread rather than being read again without one.
     if fingerprint is None:
         return None
     root = fingerprint["root"]

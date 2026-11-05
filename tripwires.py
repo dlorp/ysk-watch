@@ -7,11 +7,15 @@ Each tripwire returns findings ``{"category", "severity", "claim", "evidence"}``
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:  # loaded as a package submodule by the plugin
@@ -430,19 +434,29 @@ def _monitoring_findings(
     return []
 
 
-def scan_monitoring_diff(directory: Optional[str] = None) -> List[Finding]:
-    """``monitoring_weakened`` over the working tree against HEAD, however the edit was made."""
-    names = [
-        name
-        for name in _git_output(
-            directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", "HEAD"]
-        ).split("\0")
-        if name and not is_doc_path(name)
-    ][:_MAX_DIFF_PATHS]
-    if not names:
+def scan_monitoring_diff(
+    directory: Optional[str] = None,
+    base: Optional[str] = None,
+    deadline: Optional[float] = None,
+) -> List[Finding]:
+    """``monitoring_weakened`` over the working tree against the session's starting commit
+    (``base``, else HEAD), however the edit was made."""
+    if _no_repository(directory):
         return []
-    diff = _git_output(directory, ["diff", *_DIFF_FLAGS, "-U0", "HEAD", "--", *names])
+    start = _diff_base(directory, base)
+    listing = _git_output_checked(directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", start])
+    if listing is None:
+        return [_scan_unavailable("monitoring scan", directory)]
+    names = [name for name in listing.split("\0") if name and not is_doc_path(name)]
     findings: List[Finding] = []
+    if len(names) > _MAX_SCANNED_PATHS:
+        findings.append(_scan_capped("monitoring scan", len(names)))
+        names = names[:_MAX_SCANNED_PATHS]
+    if not names:
+        return findings
+    diff = _chunked_diff(directory, ["diff", *_DIFF_FLAGS, "-U0", start], names, deadline)
+    if diff is None:
+        return findings + [_scan_unavailable("monitoring scan", directory)]
     for chunk in re.split(r"(?m)^(?=diff --git )", diff):
         path = diff_path(chunk)
         if not path:
@@ -915,7 +929,12 @@ def _resolve_push_urls(directory: str, remote: str) -> List[str]:
     """
     try:
         proc = subprocess.run(
-            ["git", "-C", directory, "remote", "get-url", "--push", "--all", remote],
+            [
+                evidence.git_binary() or "git",
+                "-C",
+                directory,
+                *("remote", "get-url", "--push", "--all", remote),
+            ],
             env=evidence.hardened_env(),
             capture_output=True,
             text=True,
@@ -959,6 +978,14 @@ def _segments_with_ops(command: str) -> List[Tuple[str, str]]:
             continue
         if ch in ("'", '"'):
             quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        # ``2>&1``, ``>&2``, ``&>log`` and ``&>>log`` are redirections, not operators: only a
+        # bare ``&`` backgrounds a command.
+        if ch == "&" and (
+            (buf and buf[-1] == ">") or (i + 1 < len(command) and command[i + 1] == ">")
+        ):
             buf.append(ch)
             i += 1
             continue
@@ -1140,7 +1167,7 @@ def _current_branch(directory: Optional[str]) -> Optional[str]:
     ):
         try:
             proc = subprocess.run(
-                ["git", "-C", here, *args],
+                [evidence.git_binary() or "git", "-C", here, *args],
                 env=evidence.hardened_env(),
                 capture_output=True,
                 text=True,
@@ -1201,10 +1228,39 @@ def _push_invocations(command: str, start_cwd: Optional[str] = None) -> List[Dic
             here = os.path.expanduser(_expand(dash_c, env))
         if sub != "push":
             continue
+        # Config or a repository given to this one command: ``git -c remote.origin.pushurl=...``,
+        # ``GIT_CONFIG_COUNT=...``, ``GIT_DIR=...``. Nothing read from the repository describes
+        # such a push, so it is taken to land on a forge and to write main.
+        before_sub = tokens[1 : len(tokens) - len(args) - 1]
+        overridden = any(
+            t in ("-c", "--git-dir", "--work-tree", "--config-env")
+            or t.startswith(("--git-dir=", "--work-tree=", "--config-env=", "-c"))
+            for t in before_sub
+        ) or any(name.startswith(("GIT_CONFIG", "GIT_DIR", "GIT_WORK_TREE")) for name in env)
         remote: Optional[str] = None
         refs: List[str] = []
-        for token in args:
+        every_branch = False
+        mirror = False
+        args_iter = iter(args)
+        for token in args_iter:
             token = _expand(token, env)
+            if token == "--mirror":
+                # A mirror push makes the remote match: it can rewrite or delete main there
+                # whether or not a local main exists.
+                mirror = True
+                continue
+            if token in ("--all", "--branches"):
+                every_branch = True
+                continue
+            if token == "--repo":
+                remote = _expand(next(args_iter, ""), env) or remote
+                continue
+            if token in ("-o", "--push-option", "--receive-pack", "--exec"):
+                next(args_iter, None)  # the option's value, not a remote or refspec
+                continue
+            if token.startswith("--repo="):
+                remote = token[len("--repo=") :] or remote
+                continue
             if token.startswith("-"):
                 continue
             if (
@@ -1215,34 +1271,145 @@ def _push_invocations(command: str, start_cwd: Optional[str] = None) -> List[Dic
                 remote = token
                 continue
             refs.append(token)
-        found.append({"directory": here, "remote": remote, "refs": refs})
+        found.append(
+            {
+                "directory": here,
+                "remote": remote,
+                "refs": refs,
+                "every_branch": every_branch,
+                "mirror": mirror,
+                "overridden": overridden,
+            }
+        )
     return found
+
+
+def _git_config(directory: Optional[str], key: str) -> str:
+    """One config value as ``git push`` would read it; empty when unset or unreadable."""
+    return evidence.git(directory, ["config", "--get", key]).strip()
+
+
+def _default_push_remote(directory: Optional[str]) -> str:
+    """The remote a ``git push`` without one goes to, in git's order of precedence.
+
+    ``branch.<name>.pushRemote``, then ``remote.pushDefault``, then ``branch.<name>.remote``,
+    then ``origin``. A repository can point any of them at a forge while ``origin`` is a LAN
+    mirror.
+    """
+    branch = _current_branch(directory)
+    keys = [f"branch.{branch}.pushRemote"] if branch else []
+    keys.append("remote.pushDefault")
+    if branch:
+        keys.append(f"branch.{branch}.remote")
+    for key in keys:
+        value = _git_config(directory, key)
+        if value and value != ".":
+            return value
+    return _PUSH_DEFAULT_REMOTE
+
+
+def _glob_hits_main(destination: str) -> bool:
+    """A glob destination that can match main/master (``*``, ``m*``); ``feature/*`` cannot."""
+    if "*" not in destination:
+        return False
+    return any(fnmatch.fnmatchcase(name, destination) for name in _MAIN_BRANCHES)
+
+
+def _local_main_exists(directory: Optional[str]) -> bool:
+    return any(
+        evidence.git(directory, ["rev-parse", "--verify", "-q", f"refs/heads/{name}"]).strip()
+        for name in _MAIN_BRANCHES
+    )
+
+
+def _refspec_writes_main(ref: str, directory: Optional[str]) -> bool:
+    """A refspec whose destination is main/master, every branch (``:``) or a glob."""
+    destination = _ref_destination(ref)
+    if ref.strip().lstrip("+") == ":" or _glob_hits_main(destination):
+        return True
+    if destination in ("", "HEAD", "@"):
+        branch = _current_branch(directory)
+        return bool(branch) and branch.lower() in _MAIN_BRANCHES
+    return destination.lower() in _MAIN_BRANCHES
+
+
+def _bare_push_writes_main(directory: Optional[str], remote: Optional[str] = None) -> bool:
+    """Whether ``git push`` with no refspec writes main/master.
+
+    The remote's own ``remote.<name>.mirror`` and ``remote.<name>.push`` refspecs come first;
+    without them, ``push.default`` decides.
+
+    ``upstream`` (and its old name ``tracking``) pushes to the branch's configured upstream,
+    which ``branch.<name>.merge`` can point at main from any branch; ``matching`` pushes every
+    branch the remote also has, main included; ``simple`` and ``current`` push the current
+    branch to its own name; ``nothing`` pushes nothing. Unreadable config is taken as git's
+    default, ``simple``.
+    """
+    name = remote or _default_push_remote(directory)
+    if _git_config(directory, f"remote.{name}.mirror").lower() == "true":
+        return True
+    configured = [
+        line.strip()
+        for line in evidence.git(
+            directory, ["config", "--get-all", f"remote.{name}.push"]
+        ).splitlines()
+        if line.strip()
+    ]
+    if configured:
+        return any(_refspec_writes_main(ref, directory) for ref in configured)
+    mode = (_git_config(directory, "push.default") or "simple").lower()
+    if mode == "nothing":
+        return False
+    branch = _current_branch(directory)
+    if mode in ("upstream", "tracking"):
+        merge = _git_config(directory, f"branch.{branch}.merge") if branch else ""
+        target = _ref_destination(merge) if merge else (branch or "")
+        return bool(target) and target.lower() in _MAIN_BRANCHES
+    if mode == "matching":
+        return _local_main_exists(directory)
+    return bool(branch) and branch.lower() in _MAIN_BRANCHES
 
 
 def _push_targets_main(invocation: Dict[str, Optional[str]]) -> bool:
     """True when this push writes main/master, whether by refspec, HEAD, or the current branch."""
     refs = [str(ref) for ref in (invocation.get("refs") or [])]
+    if invocation.get("overridden") or invocation.get("mirror"):
+        return True
+    if invocation.get("every_branch") and _local_main_exists(invocation.get("directory")):
+        return True
     if any(_ref_destination(ref).lower() in _MAIN_BRANCHES for ref in refs):
         return True
+    if any(
+        ref.strip().lstrip("+") == ":" or _glob_hits_main(_ref_destination(ref)) for ref in refs
+    ):
+        return True
+    if not refs:
+        return _bare_push_writes_main(invocation.get("directory"), invocation.get("remote"))
     if all(_ref_destination(ref) in ("", "HEAD", "@") for ref in refs):
         branch = _current_branch(invocation.get("directory"))
         return bool(branch) and branch.lower() in _MAIN_BRANCHES
     return False
 
 
-def _push_lands_on_a_forge(directory: Optional[str], remote: Optional[str]) -> bool:
+def _push_lands_on_a_forge(
+    directory: Optional[str], remote: Optional[str], *, overridden: bool = False
+) -> bool:
     """True when the push cannot be proven to target a local filesystem remote.
 
     Only a resolved filesystem remote (a LAN bare mirror) returns False. Every
-    inconclusive case returns True, so a real public-main push is never dropped.
+    inconclusive case returns True, so a real public-main push is never dropped. A path given
+    as the remote is resolved too: ``url.<forge>.insteadOf`` can rewrite a path to a forge.
     """
+    if overridden:
+        return True
+    here = directory or os.getcwd()
     if remote is not None:
         if _is_filesystem_remote(remote):
-            return False
+            resolved = evidence.git(here, ["ls-remote", "--get-url", remote]).strip()
+            return bool(resolved) and not _is_filesystem_remote(resolved)
         if _is_forge_remote(remote):
             return True
-    here = directory or os.getcwd()
-    urls = _resolve_push_urls(here, remote or _PUSH_DEFAULT_REMOTE)
+    urls = _resolve_push_urls(here, remote or _default_push_remote(here))
     if not urls:
         return True
     return not all(_is_filesystem_remote(url) for url in urls)
@@ -1574,7 +1741,9 @@ def _attribution_finding(command: str) -> Optional[Finding]:
 
 
 _GIT_TIMEOUT_S = 5.0
+# Paths per ``git diff`` call, and the most a scan reads. Past the cap the scan says so.
 _MAX_DIFF_PATHS = 20
+_MAX_SCANNED_PATHS = 2000
 # ``diff.external`` and a ``textconv`` driver are programs the repository names; either would
 # decide what the scanned diff says. Plain text diffs only, and only of real content.
 # Fixed by flag, whatever the repository's diff config or attributes say: the ``a/``/``b/``
@@ -1594,6 +1763,12 @@ _DIFF_FLAGS = (
 
 
 def _git_output(directory: Optional[str], args: List[str]) -> str:
+    """Read-only git output from the top of the working tree; empty on any failure."""
+    return _git_output_checked(directory, args) or ""
+
+
+def _git_output_checked(directory: Optional[str], args: List[str]) -> Optional[str]:
+    """Like ``_git_output``, but ``None`` when git fails, so a scan can say it did not run."""
     # From the top of the working tree: ``--name-only`` prints root-relative paths, and they
     # come back here as pathspecs, which git reads relative to the directory it runs in.
     here = evidence.repo_root(directory) or directory or os.getcwd()
@@ -1602,21 +1777,69 @@ def _git_output(directory: Optional[str], args: List[str]) -> str:
         # from the diff are passed back as literal names, not pathspec magic or globs.
         filters = evidence.filter_overrides(here)
         if filters is None:
-            return ""
+            return None
         env = evidence.hardened_env(extra=filters)
         env["GIT_LITERAL_PATHSPECS"] = "1"
         proc = subprocess.run(
-            ["git", "-C", here, *args],
+            [evidence.git_binary() or "git", "-C", here, *args],
             env=env,
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return None
     if proc.returncode != 0:
-        return ""
+        return None
     return proc.stdout or ""
+
+
+def _diff_base(directory: Optional[str], base: Optional[str]) -> str:
+    """The commit a scan compares against: the session's starting commit when it still
+    exists, else HEAD. Against HEAD alone, a weakened test that was committed is gone from
+    the diff."""
+    if base and re.fullmatch(r"[0-9a-f]{7,64}", base):
+        ok, _ = evidence._run_git(
+            evidence.repo_root(directory) or directory, ["cat-file", "-e", f"{base}^{{commit}}"]
+        )
+        if ok:
+            return base
+    return "HEAD"
+
+
+def _no_repository(directory: Optional[str]) -> bool:
+    """Nothing to scan: not inside a repository at all. A repository git cannot read is not
+    this case; its scan is reported as not run."""
+    if evidence.repo_root(directory):
+        return False
+    here = directory or os.getcwd()
+    return not (shutil.which("git") and evidence._inside_git_metadata_tree(here))
+
+
+def _scan_unavailable(what: str, directory: Optional[str]) -> Finding:
+    """A diff scan that could not run is reported, never read as a clean diff."""
+    return _finding(
+        "guard_degraded",
+        "high",
+        f"{what} did not run: the working-tree diff could not be read",
+        str(evidence.repo_root(directory) or directory or "")[:300],
+    )
+
+
+def _chunked_diff(
+    directory: Optional[str], args: List[str], names: List[str], deadline: Optional[float] = None
+) -> Optional[str]:
+    """``git diff <args> -- <names>`` in chunks, so no path past the first few goes unread.
+    ``None`` on a git failure or once ``deadline`` passes."""
+    parts: List[str] = []
+    for start in range(0, len(names), _MAX_DIFF_PATHS):
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        out = _git_output_checked(directory, [*args, "--", *names[start : start + _MAX_DIFF_PATHS]])
+        if out is None:
+            return None
+        parts.append(out)
+    return "".join(parts)
 
 
 def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
@@ -1654,27 +1877,59 @@ def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
     return cwd
 
 
+def _scan_capped(what: str, count: int) -> Finding:
+    """A scan that could not read every changed path holds the claim like an unreadable one."""
+    return _finding(
+        "guard_degraded",
+        "high",
+        f"{what} read the first {_MAX_SCANNED_PATHS} of {count} changed paths",
+        f"{count} paths changed",
+    )
+
+
 def scan_git_diff(
-    paths: Optional[List[str]] = None, directory: Optional[str] = None
+    paths: Optional[List[str]] = None,
+    directory: Optional[str] = None,
+    base: Optional[str] = None,
+    deadline: Optional[float] = None,
 ) -> List[Finding]:
     """Test weakening visible in the working-tree diff, however the edit was made.
 
-    ``sed -i`` and Python one-liners never reach an edit hook. Comparing the tree to HEAD
-    is deterministic, needs no hook, and also recovers the prior content of a whole-file
-    write, which is exactly what a skip/assertion count needs.
+    ``sed -i`` and Python one-liners never reach an edit hook. Comparing the tree to the
+    session's starting commit (``base``, else HEAD) is deterministic, needs no hook, sees a
+    weakened test even after it was committed, and recovers the prior content of a
+    whole-file write, which is exactly what a skip/assertion count needs. Every changed
+    test file is read, in chunks; a git failure is reported rather than taken as no diff.
     """
-    if paths:
-        candidates = [str(path) for path in paths if _is_test_path(str(path))]
+    if _no_repository(directory):
+        return []
+    start = _diff_base(directory, base)
+    named = [str(path) for path in (paths or []) if _is_test_path(str(path))]
+    if directory is None:
+        # Where the terminal is was never learned: the plugin's own working directory says
+        # nothing about it. Only the paths the edit hooks named are scanned.
+        changed = named
     else:
-        listing = _git_output(directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", "HEAD"])
-        candidates = [name for name in listing.split("\0") if name and _is_test_path(name)]
-    candidates = candidates[:_MAX_DIFF_PATHS]
-    if not candidates:
-        return []
-    diff = _git_output(directory, ["diff", *_DIFF_FLAGS, "HEAD", "--", *candidates])
+        listing = _git_output_checked(directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", start])
+        if listing is None:
+            return [_scan_unavailable("test-weakening scan", directory)]
+        changed = [name for name in listing.split("\0") if name and _is_test_path(name)]
+    if named:
+        # Paths the edit hooks saw, plus anything else the diff shows: a hook only sees the
+        # edits made through it.
+        changed = list(dict.fromkeys([*named, *changed]))
+    findings: List[Finding] = []
+    if len(changed) > _MAX_SCANNED_PATHS:
+        findings.append(_scan_capped("test-weakening scan", len(changed)))
+        changed = changed[:_MAX_SCANNED_PATHS]
+    if not changed:
+        return findings
+    diff = _chunked_diff(directory, ["diff", *_DIFF_FLAGS, start], changed, deadline)
+    if diff is None:
+        return findings + [_scan_unavailable("test-weakening scan", directory)]
     if not diff.strip():
-        return []
-    return scan_diff(diff, ", ".join(candidates))
+        return findings
+    return findings + scan_diff(diff, ", ".join(changed[:_MAX_DIFF_PATHS]))
 
 
 def scan_command(
@@ -1696,7 +1951,9 @@ def scan_command(
             continue
         directory = invocation.get("directory")
         remote = invocation.get("remote")
-        if not _push_lands_on_a_forge(directory, remote):
+        if not _push_lands_on_a_forge(
+            directory, remote, overridden=bool(invocation.get("overridden"))
+        ):
             continue
         match = re.search(r"\bgit\b[\s\S]*?\bpush\b", command)
         push_evidence = _window(command, match.start(), match.end()) if match else command
@@ -1765,6 +2022,277 @@ def scan_command(
     return findings
 
 
+# Commands that run beside a test invocation without changing the working tree.
+_TREE_NEUTRAL_HEADS = frozenset(
+    {
+        "cd",
+        "pushd",
+        "popd",
+        "export",
+        "set",
+        "unset",
+        "true",
+        ":",
+        "echo",
+        "printf",
+        "tail",
+        "head",
+        "grep",
+        "cat",
+        "wc",
+        "sort",
+        "uniq",
+        "sleep",
+        "date",
+        "pwd",
+        "ls",
+        "which",
+        "type",
+        "test",
+        "[",
+    }
+)
+_BACKGROUND_WORDS = frozenset({"nohup", "setsid", "disown"})
+# git subcommands that only read.
+_GIT_READ_ONLY = frozenset(
+    {"status", "log", "diff", "show", "rev-parse", "describe", "ls-files", "blame", "shortlog"}
+)
+# Linters and type checkers that only read unless told to fix: (head, first argument or "").
+_READ_ONLY_TOOLS = frozenset(
+    {
+        ("ruff", "check"),
+        ("ruff", "format"),
+        ("mypy", ""),
+        ("flake8", ""),
+        ("pylint", ""),
+        ("pyright", ""),
+        ("eslint", ""),
+        ("tsc", ""),
+        ("go", "vet"),
+        ("cargo", "check"),
+        ("cargo", "clippy"),
+        ("black", ""),
+        ("isort", ""),
+    }
+)
+_FIX_FLAGS = ("--fix", "--write", "-w", "--in-place", "-i")
+# Tools whose read-only mode needs a flag: they write by default.
+_NEEDS_CHECK_FLAG = {"black": "--check", "isort": "--check", "ruff format": "--check"}
+# Settings that change what the tests import or how they run, without touching the tree.
+_RUN_STEERING_VARS = re.compile(
+    r"^(?:PYTHONPATH|PYTHONSTARTUP|PYTHONHOME|PYTEST_ADDOPTS|PYTEST_PLUGINS|NODE_PATH|"
+    r"NODE_OPTIONS|GOPATH|GOFLAGS|RUSTFLAGS|LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|ENV)="
+)
+# An output redirection to a file. ``>/dev/null`` and fd duplications (``2>&1``) write nothing.
+_FILE_REDIRECT_RE = re.compile(r"(?:^|[\s;|&])(?:\d*|&)>>?\|?\s*(?!&|/dev/)(\S+)")
+# Code lines that cannot run anything: a stdlib import, a print or exit with no call in it.
+_CODE_IMPORT_RE = re.compile(
+    r"^\s*(?:import\s+([\w.]+)(?:\s+as\s+\w+)?|from\s+([\w.]+)\s+import\s+[\w, ()]+)\s*$"
+)
+_CODE_PLAIN_RE = re.compile(r"^\s*(?:#.*|print\([^()]*\)|sys\.exit\([^()]*\))?\s*$")
+# Shell text that runs a command wherever it appears: substitution and process substitution.
+_SUBSTITUTION_RE = re.compile(r"\$\(|`|<\(|>\(")
+# Test-runner options that load code or configuration from outside the tree.
+_RUNNER_LOADING_RE = re.compile(
+    r"(?:^|\s)(?:-p\s*(?!no:)\S+|-c\s*\S+|-o\s*\S+|--override-ini|--rootdir|--confcutdir|"
+    r"--pyargs|-r\s|--require|--setupFiles|--config)"
+)
+_POST_RUN_BUDGET_S = 15.0
+# Files a test run writes about itself. A difference between the readings before and after a
+# run that is only these is the run's own output, not a change to the code it tested.
+_REPORT_FLAG_RES = (
+    re.compile(r"--junit-?xml(?:=|\s+)(\S+)"),
+    re.compile(r"--json-report-file(?:=|\s+)(\S+)"),
+    re.compile(r"--outputFile(?:=|\s+)(\S+)"),
+    re.compile(r"--cov-report(?:=|\s+)(?:xml|json|lcov|html):(\S+)"),
+)
+_ARTIFACT_DIRS = (
+    ".hypothesis/",
+    "test-results/",
+    "playwright-report/",
+    "coverage/",
+    ".nyc_output/",
+)
+_ARTIFACT_NAMES = frozenset({"coverage.xml", "coverage.json", "lcov.info"})
+
+
+def run_artifact(path: str, command: str, cwd: Optional[str], root: Optional[str]) -> bool:
+    """Whether ``path`` (root-relative) is a report the test command writes about itself."""
+    if path.startswith(_ARTIFACT_DIRS) or any(f"/{d}" in f"/{path}" for d in _ARTIFACT_DIRS):
+        return True
+    if os.path.basename(path) in _ARTIFACT_NAMES:
+        return True
+    if not root:
+        return False
+    for pattern in _REPORT_FLAG_RES:
+        for match in pattern.finditer(command or ""):
+            named = os.path.expanduser(match.group(1).strip("'\""))
+            if not os.path.isabs(named):
+                named = os.path.join(cwd or root, named)
+            if os.path.realpath(named) == os.path.realpath(os.path.join(root, path)):
+                return True
+    return False
+
+
+def _inside(target: str, root: Optional[str], cwd: Optional[str]) -> bool:
+    """Whether a path written by the command lands in the repository (unknown: yes)."""
+    if not root:
+        return True
+    path = os.path.expanduser(target)
+    if not os.path.isabs(path):
+        if not cwd:
+            return True
+        path = os.path.join(cwd, path)
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    return real == real_root or real.startswith(real_root + os.sep)
+
+
+def _redirects_into(segment: str, root: Optional[str], cwd: Optional[str]) -> bool:
+    """An output redirection whose file is inside the repository."""
+    return any(
+        _inside(match.group(1).strip("'\""), root, cwd)
+        for match in _FILE_REDIRECT_RE.finditer(strip_quotes(segment))
+    )
+
+
+def _writes_files(
+    segment: str, tokens: List[str], head: str, root: Optional[str], cwd: Optional[str]
+) -> bool:
+    """A segment that writes a file in the repository: a redirection, ``tee`` or ``sort -o``."""
+    if _redirects_into(segment, root, cwd):
+        return True
+    if head == "tee":
+        return any(
+            not t.startswith("-") and not t.startswith("/dev/") and _inside(t, root, cwd)
+            for t in tokens[1:]
+        )
+    if head == "sort":
+        return any(t == "-o" or t.startswith(("-o", "--output")) for t in tokens[1:])
+    return False
+
+
+def _neutral_segment(
+    segment: str, tokens: List[str], root: Optional[str] = None, cwd: Optional[str] = None
+) -> Optional[str]:
+    """``None`` when a non-test segment cannot write the tree, else why it can."""
+    idx = 0
+    while idx < len(tokens) and _ASSIGN_RE.match(tokens[idx]):
+        if _RUN_STEERING_VARS.match(tokens[idx]):
+            return f"`{tokens[idx].split('=', 1)[0]}` changes what the tests run"
+        idx += 1
+    if idx >= len(tokens):
+        return None
+    head = os.path.basename(tokens[idx])
+    rest = tokens[idx + 1 :]
+    if head in _BACKGROUND_WORDS:
+        return "a command runs in the background"
+    if _writes_files(segment, tokens[idx:], head, root, cwd):
+        return f"`{head}` writes a file in the same command as the tests"
+    if head == "export":
+        steering = [t for t in rest if _RUN_STEERING_VARS.match(t)]
+        return f"`{steering[0].split('=', 1)[0]}` changes what the tests run" if steering else None
+    if head in ("source", "."):
+        # A virtualenv's activate script only sets PATH; any other script can do anything.
+        if rest and rest[0].endswith(("bin/activate", "bin/activate.fish")):
+            return None
+        return f"`{head}` runs a script in the same command as the tests"
+    if head == "env":
+        return (
+            None
+            if not [t for t in rest if not _ASSIGN_RE.match(t)]
+            else ("`env` runs a command in the same command as the tests")
+        )
+    if head == "git":
+        sub, sub_args, _ = _git_subcommand(tokens, idx)
+        configured = any(
+            t in ("-c", "--config-env") or t.startswith(("-c", "--config-env="))
+            for t in tokens[idx + 1 : len(tokens) - len(sub_args) - 1]
+        )
+        writes = any(t.startswith(("--output", "-o")) for t in sub_args)
+        if sub in _GIT_READ_ONLY and not configured and not writes:
+            return None
+        name = f"git {sub}" if sub else "git"
+        return f"`{name}` runs in the same command as the tests"
+    first = rest[0] if rest and not rest[0].startswith("-") else ""
+    tool = (head, first) if (head, first) in _READ_ONLY_TOOLS else (head, "")
+    if tool in _READ_ONLY_TOOLS:
+        label = " ".join(part for part in tool if part)
+        needs = _NEEDS_CHECK_FLAG.get(label)
+        fixing = any(t in _FIX_FLAGS or t.startswith("--fix") for t in rest)
+        if not fixing and (needs is None or needs in rest):
+            return None
+        return f"`{label}` can rewrite files in the same command as the tests"
+    if head in _TREE_NEUTRAL_HEADS:
+        return None
+    return f"`{head}` runs in the same command as the tests"
+
+
+def _uncredited_reason(
+    command: str,
+    invocations: List[Dict[str, Any]],
+    is_code: bool,
+    root: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Optional[str]:
+    """Why a green run cannot be credited with a tree, or ``None`` when it can.
+
+    The tree is read just before the command and again after it. A command that changes the
+    tree and puts it back around the test step (``cat good.py > src/x.py && pytest && cat
+    evil.py > src/x.py``) leaves both readings equal while the tests saw something else. A
+    green run is credited with a tree only when nothing else in the command can write the
+    tree or steer the run: ``cd``, plain ``export``s, a virtualenv's ``activate``, read-only
+    ``git``, linters and type checkers without a fix flag, and filters that read the output.
+    A file redirection, a script, ``env`` running a command, a setting such as
+    ``PYTHONPATH``, or anything in the background is never neutral.
+    """
+    if is_code:
+        for line in (command or "").splitlines():
+            if ";" in line:
+                return "the code does more than run the tests"
+            imported = _CODE_IMPORT_RE.match(line)
+            if imported:
+                module = (imported.group(1) or imported.group(2) or "").split(".")[0]
+                if module in sys.stdlib_module_names:
+                    continue
+                return f"the code imports `{module}`"
+            if _CODE_PLAIN_RE.match(line) or (
+                _CALL_TEST_RE.search(line) and not _SUBSTITUTION_RE.search(line)
+            ):
+                continue
+            return "the code does more than run the tests"
+        return None
+    tests = {str(inv.get("segment") or "").strip() for inv in invocations}
+    for segment, op in _segments_with_ops(command):
+        if op.strip() == "&":
+            return "a command runs in the background"
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        if _SUBSTITUTION_RE.search(segment):
+            return "a command substitution runs in the same command as the tests"
+        tokens = _tokens(segment)
+        if stripped in tests:
+            # The test invocation itself: it may not write files either, and settings in
+            # front of it (``PYTHONPATH=/tmp/x pytest``) steer what it imports.
+            for token in tokens:
+                if not _ASSIGN_RE.match(token):
+                    break
+                if _RUN_STEERING_VARS.match(token):
+                    return f"`{token.split('=', 1)[0]}` changes what the tests run"
+            if _redirects_into(segment, root, cwd):
+                return "the test output is written to a file in the tree"
+            if _RUNNER_LOADING_RE.search(strip_quotes(segment)):
+                return "the test runner is told to load code or config from elsewhere"
+            continue
+        reason = _neutral_segment(segment, tokens, root, cwd)
+        if reason:
+            return reason
+    if command.rstrip().endswith("&") and not command.rstrip().endswith("&&"):
+        return "a command runs in the background"
+    return None
+
+
 def _test_evidence(
     command: str,
     result: Any,
@@ -1782,6 +2310,8 @@ def _test_evidence(
     run_dir = (command_cwd(command, cwd) or cwd) if not is_code else cwd
     results = evidence.parse_results(command, _output_of(result), run_dir, not_before=not_before)
     narrow = evidence.narrowing_flags(command)
+    run_root = evidence.repo_root(run_dir) if run_dir else None
+    uncredited = _uncredited_reason(command, invocations, is_code, run_root, run_dir)
     tree: Optional[Dict[str, Any]] = None
     events: List[Finding] = []
     for invocation in invocations:
@@ -1790,11 +2320,11 @@ def _test_evidence(
         # both things the watched agent can write, so they never turn an unknown into a pass.
         if results is not None and results["failed"] + results["errors"] > 0:
             passed = False
-        if passed is True and tree is None and run_dir:
+        if passed is True and tree is None and run_dir and not uncredited:
             # The tree a green run describes, so a later claim can be checked against it.
             # Only where the run is known to have happened: the plugin's own working
             # directory says nothing about the terminal's.
-            tree = evidence.fingerprint(run_dir)
+            tree = evidence.fingerprint(run_dir, deadline=time.monotonic() + _POST_RUN_BUDGET_S)
         claim = f"{invocation['tool']} run"
         if results is not None:
             claim += (
@@ -1821,6 +2351,8 @@ def _test_evidence(
         if run_dir:
             event["run_dir"] = run_dir
         if tree:
+            # For pairing with the reading before the run; dropped before the event is kept.
+            event["_tree_changes"] = tree.get("changes") or {}
             event["tree"] = tree["hash"]
             event["tree_root"] = tree["root"]
             event["head"] = tree["head"]
@@ -1833,6 +2365,8 @@ def _test_evidence(
             if unread_root:
                 event["tree_root"] = unread_root
                 event["tree_unavailable"] = True
+                if uncredited:
+                    event["tree_unavailable_reason"] = uncredited
         events.append(event)
     return events
 

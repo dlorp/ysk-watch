@@ -7,6 +7,8 @@ says only what matters — and turns it to a different job: deterministic tripwi
 auditing of what an agent claims, so an unattended run can be checked without a human watching the
 scrollback.
 
+* ``pre_tool_call`` — before a test command, the tree it is about to run on, so the run is
+  credited with what it saw rather than what the command left behind. Bounded, never blocks.
 * ``post_tool_call`` — free deterministic tripwires per tool call (tests weakened, destructive
   commands, secrets touched, errors swallowed) plus test-run evidence, kept in a bounded
   per-profile, per-session ledger. No model call.
@@ -55,6 +57,18 @@ logger = logging.getLogger(__name__)
 _MAX_SESSIONS = 64  # ledgers kept per process (LRU)
 _MAX_EVENTS = 300  # events kept per session ledger
 _AUX_TIMEOUT_S = 45.0
+# Hermes fails a pre_tool_call hook closed (the call is blocked) at plugins.hook_callback_timeout,
+# 30 s by default. The pre-run fingerprint gives up well inside that.
+_PRE_RUN_BUDGET_S = 8.0
+_MAX_PRE_RUNS = 256
+# Hermes abandons pre_verify, transform_llm_output and post_tool_call at the same 30 s and then
+# skips them: a check that outlasts it fails open. Every fingerprint and diff scan in one of
+# those hooks shares this budget, and a tree not read inside it is "evidence unavailable".
+_CHECK_BUDGET_S = 20.0
+_NOTE_ROOT_BUDGET_S = 10.0
+# A pre-run reading that was attempted but could not read the tree.
+_PRE_UNREAD = ("", "", None)
+_GIT_DASH_C_RE = re.compile(r"\bgit\s+(?:-[^C\s]\S*\s+)*-C\s+(\S+)")
 _AUX_MAX_TOKENS = 700
 _AUX_INPUT_CHARS = 24_000  # ~6K tokens of ledger + response text
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -108,6 +122,14 @@ def _home() -> Path:
     from hermes_constants import get_hermes_home
 
     return Path(get_hermes_home())
+
+
+def _stat_cache_dir() -> Path:
+    """The fingerprint's stat cache, beside the watcher's other files under ``$HERMES_HOME``."""
+    return _home() / "cache" / "ysk-watch" / "stat"
+
+
+evidence.set_cache_dir_provider(_stat_cache_dir)
 
 
 def _home_key() -> str:
@@ -202,8 +224,18 @@ def _ledger(key_id: str) -> Dict[str, Any]:
                 # alone does not clear one; the answer has to name it.
                 "open": {},
                 # Repositories this session has worked in: root -> {"baseline": tree hash at
-                # first sight, or None once an edit tool has written there}.
+                # first sight, or None once an edit tool has written there; "base_head": the
+                # commit at first sight, which the diff scans compare against}.
                 "roots": {},
+                # Trees read just before a test command, by tool call: (tree, root), or
+                # _PRE_UNREAD when the reading was attempted and failed.
+                "pre_runs": OrderedDict(),
+                # HEAD of a repository read before the first command there ran: the commit the
+                # diff scans compare against, before that command could commit anything.
+                "pre_base": {},
+                # Pre-run readings in flight, by repository: {"done": Event, "tree": ...}. A
+                # second test call on the same repository waits for it instead of reading again.
+                "pre_inflight": {},
                 # Allowlist object id per repository at first sight, so an exception the run
                 # commits for itself does not apply to high findings.
                 "allow_blob": {},
@@ -389,11 +421,19 @@ def _note_root(led: Dict[str, Any], directory: Optional[str], *, edited: bool) -
                 known["baseline"] = None
             return
     baseline = None
-    if not edited:
-        fingerprint = evidence.tree_fingerprint(root)
-        baseline = fingerprint["hash"] if fingerprint else None
     with _lock:
-        led["roots"].setdefault(root, {"baseline": baseline})
+        base_head = led["pre_base"].pop(root, None)
+    if not edited:
+        fingerprint = evidence.tree_fingerprint(
+            root, deadline=time.monotonic() + _NOTE_ROOT_BUDGET_S
+        )
+        baseline = fingerprint["hash"] if fingerprint else None
+        if base_head is None and fingerprint:
+            base_head = fingerprint["head_full"]
+    if base_head is None:
+        base_head = evidence.git(root, ["rev-parse", "HEAD"]).strip() or None
+    with _lock:
+        led["roots"].setdefault(root, {"baseline": baseline, "base_head": base_head})
 
 
 def _finding_dir(known_cwd: Optional[str], args: Any) -> Optional[str]:
@@ -507,6 +547,187 @@ def _apply_rules() -> Dict[str, Any]:
 # --- hooks --------------------------------------------------------------------------------------
 
 
+def _pre_run_key(tool_call_id: str, args: Any) -> str:
+    """Pairs a pre_tool_call with its post_tool_call: the call id, else the command text."""
+    if tool_call_id:
+        return f"id:{tool_call_id}"
+    command = tripwires._command_of(args) if isinstance(args, dict) else ""
+    return "cmd:" + hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _bounded_fingerprint(
+    directory: str, budget: float, on_done: Any = None
+) -> Optional[Dict[str, Any]]:
+    """``evidence.fingerprint`` that returns within ``budget`` seconds whatever git does.
+
+    The work runs in a daemon thread with a deadline it checks itself; if git outlasts the
+    join, the result is dropped and the caller treats the tree as unread. ``on_done`` runs in
+    the thread when the work really ends, however late.
+    """
+    box: Dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["tree"] = evidence.fingerprint(directory, deadline=time.monotonic() + budget)
+        except Exception:
+            box["tree"] = None
+        finally:
+            if on_done is not None:
+                on_done(box.get("tree"))
+
+    thread = threading.Thread(target=work, name="ysk-watch-pre-run", daemon=True)
+    thread.start()
+    thread.join(budget + 1.0)
+    return box.get("tree")
+
+
+def _shared_pre_run_tree(
+    led: Dict[str, Any], busy_key: str, run_dir: str
+) -> Optional[Dict[str, Any]]:
+    """One reading per repository at a time. A second test call while one is in flight
+    (two in one turn) waits for it, within the same budget, and shares it: neither command
+    has run yet, so it is the same tree. The flag clears when the reading really ends."""
+    with _lock:
+        inflight = led["pre_inflight"].get(busy_key)
+        owner = inflight is None
+        if owner:
+            inflight = {"done": threading.Event(), "tree": None}
+            led["pre_inflight"][busy_key] = inflight
+    if not owner:
+        inflight["done"].wait(_PRE_RUN_BUDGET_S + 1.0)
+        return inflight["tree"] if inflight["done"].is_set() else None
+
+    def finished(tree: Optional[Dict[str, Any]]) -> None:
+        inflight["tree"] = tree
+        inflight["done"].set()
+        with _lock:
+            if led["pre_inflight"].get(busy_key) is inflight:
+                del led["pre_inflight"][busy_key]
+
+    _bounded_fingerprint(run_dir, _PRE_RUN_BUDGET_S, on_done=finished)
+    return inflight["tree"] if inflight["done"].is_set() else None
+
+
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Any = None,
+    session_id: str = "",
+    task_id: str = "",
+    tool_call_id: str = "",
+    **_: Any,
+) -> None:
+    """Read the tree a test command is about to run on. Never blocks the call.
+
+    ``pytest && cp evil.py src/`` passes and then changes the tree: read only afterwards,
+    the green run would be credited with code it never saw. The post-call hook credits the
+    run with this tree instead (``_credit_pre_run_tree``).
+    """
+    if _disabled() or tool_name not in _COMMAND_TOOLS or not isinstance(args, dict):
+        return None
+    try:
+        command = tripwires._command_of(args)
+        is_code = tool_name == "execute_code" or ("code" in args and "command" not in args)
+        ids = _ledger_ids(session_id, task_id)
+        known_cwd = _last_cwd(ids[0])
+        run_dir = known_cwd if is_code else (tripwires.command_cwd(command, known_cwd) or known_cwd)
+        led = _ledger(ids[0])
+        root = _repo_root(run_dir) if run_dir else None
+        # The commit before this command runs, for every repository it names: a first command
+        # that weakens a test and commits it must not become the base the diff scans compare
+        # against. ``git -C <dir>`` reaches a repository without any ``cd``.
+        targets = [root] if root else []
+        for match in _GIT_DASH_C_RE.finditer(command or ""):
+            target = os.path.expanduser(match.group(1).strip("'\""))
+            if not os.path.isabs(target) and run_dir:
+                target = os.path.join(run_dir, target)
+            other = _repo_root(target) if os.path.isdir(target) else None
+            if other and other not in targets:
+                targets.append(other)
+        for target_root in targets[:4]:
+            with _lock:
+                unseen = target_root not in led["roots"] and target_root not in led["pre_base"]
+            if unseen:
+                head = evidence.git(target_root, ["rev-parse", "HEAD"]).strip()
+                if head:
+                    with _lock:
+                        led["pre_base"].setdefault(target_root, head)
+        found = (
+            tripwires._code_test_invocations(command)
+            if is_code
+            else tripwires._test_invocations(command)
+        )
+        if not found or not run_dir:
+            return None
+        key = _pre_run_key(tool_call_id, args)
+        tree = _shared_pre_run_tree(led, root or run_dir, run_dir)
+        with _lock:
+            pre = led["pre_runs"]
+            pre[key] = (
+                (tree["hash"], tree["root"], tree.get("changes") or {}) if tree else _PRE_UNREAD
+            )
+            while len(pre) > _MAX_PRE_RUNS:
+                pre.popitem(last=False)
+    except Exception:
+        logger.debug("ysk-watch pre_tool_call failed", exc_info=True)
+    return None
+
+
+def _credit_pre_run_tree(
+    led: Dict[str, Any], key: str, findings: List[Dict[str, Any]], command: str = ""
+) -> None:
+    """Credit each green ``test_run`` with the tree read before its command ran.
+
+    When the command changed the tree (``pytest && cp evil.py src/``, a formatter before the
+    tests), the run keeps the earlier tree and records the later one as ``tree_after``: a
+    claim about the later code then needs a run that saw it. A reading that was attempted and
+    failed leaves the run with no tree ("evidence unavailable"): forcing the earlier read to
+    fail must not fall back to the later tree. Only when no pre-run hook fired at all (an
+    older Hermes, a call routed around it) does the tree read afterwards stand.
+    """
+    with _lock:
+        before = led["pre_runs"].pop(key, None)
+    post_changes = {
+        id(event): event.pop("_tree_changes", None)
+        for event in findings
+        if "_tree_changes" in event
+    }
+    if before is None:
+        return
+    tree, root, pre_changes = before
+    for event in findings:
+        if event.get("category") != "test_run" or event.get("passed") is not True:
+            continue
+        if before == _PRE_UNREAD:
+            # The tree the tests were about to run on could not be read. The tree read after
+            # them describes what the command left behind, not what the tests saw.
+            if event.get("tree"):
+                event["tree_after"] = event.pop("tree")
+            event["tree_unavailable"] = True
+            event["tree_unavailable_reason"] = "the tree could not be read before the run"
+            continue
+        after = event.get("tree")
+        if after and event.get("tree_root") == root and after != tree:
+            changes = post_changes.get(id(event)) or {}
+            moved = [
+                path
+                for path in {**pre_changes, **changes}
+                if pre_changes.get(path) != changes.get(path)
+            ]
+            if moved and all(
+                not (changes.get(path) or ("", False))[1]
+                and not (pre_changes.get(path) or ("", False))[1]
+                and tripwires.run_artifact(path, command, event.get("run_dir"), root)
+                for path in moved
+            ):
+                # Only the run's own reports appeared (a JUnit file, coverage, .hypothesis):
+                # the code the tests saw is the code still there.
+                event["tree_artifacts"] = sorted(moved)[:10]
+                continue
+            event["tree_after"] = after
+            event["tree"] = tree
+            event["tree_changed_during_run"] = True
+
+
 def _on_post_tool_call(
     tool_name: str = "",
     args: Any = None,
@@ -515,6 +736,7 @@ def _on_post_tool_call(
     session_id: str = "",
     task_id: str = "",
     duration_ms: Any = None,
+    tool_call_id: str = "",
     **_: Any,
 ) -> None:
     if _disabled():
@@ -541,6 +763,12 @@ def _on_post_tool_call(
         findings = tripwires.scan_tool_call(
             tool_name, args, result, status, cwd=known_cwd, not_before=not_before
         )
+        if tool_name in _COMMAND_TOOLS:
+            _credit_pre_run_tree(
+                led, _pre_run_key(tool_call_id, args), findings, tripwires._command_of(args)
+            )
+        for event in findings:
+            event.pop("_tree_changes", None)
         findings += _behaviour_findings(ids, tool_name, args, result)
         commands = _COMMAND_TOOLS
         call_dir = _call_dir(tool_name, args, known_cwd)
@@ -799,7 +1027,8 @@ def _stale_test_evidence(
             name = os.path.basename(root) or root
             run = newest_by_root.get(root)
             if run is not None and not run.get("tree"):
-                unavailable.append(f"{name}: the passing run's tree could not be read")
+                reason = run.get("tree_unavailable_reason") or "its tree could not be read"
+                unavailable.append(f"{name}: the passing run is not credited ({reason})")
                 continue
             current = fingerprint(root)
             if run is not None:
@@ -807,9 +1036,15 @@ def _stale_test_evidence(
                     unavailable.append(f"{name}: the tree could not be read to compare")
                 elif current["hash"] != run["tree"]:
                     paths = ", ".join(str(p) for p in (current.get("paths") or [])[:4])
+                    during = (
+                        " (the test command itself changed the tree)"
+                        if run.get("tree_changed_during_run")
+                        and current["hash"] == run.get("tree_after")
+                        else ""
+                    )
                     problems.append(
                         f"{name}: tests passed on tree {run['tree']}, the tree is now "
-                        f"{current['hash']}" + (f" ({paths})" if paths else "")
+                        f"{current['hash']}" + (f" ({paths})" if paths else "") + during
                     )
                 continue
             baseline = (roots.get(root) or {}).get("baseline")
@@ -1200,11 +1435,12 @@ def _pre_verify(
         roots = {root: dict(state) for root, state in led["roots"].items()}
 
     fingerprints: Dict[str, Optional[Dict[str, Any]]] = {}
+    deadline = time.monotonic() + _CHECK_BUDGET_S
 
     def fingerprint(where: Optional[str]) -> Optional[Dict[str, Any]]:
         key = where or ""
         if key not in fingerprints:
-            fingerprints[key] = evidence.fingerprint(where)
+            fingerprints[key] = evidence.fingerprint(where, deadline=deadline)
         return fingerprints[key]
 
     root_here = _repo_root(directory) if directory else None
@@ -1233,9 +1469,24 @@ def _pre_verify(
         if c
     ]
     paths = changed_paths or []
+    # Against the commit the session started from: a weakened test that was committed since
+    # is still in that diff.
+    base_head = (roots.get(root_here) or {}).get("base_head") if root_here else None
+    if base_head and tripwires._diff_base(directory, base_head) != base_head:
+        # The commit the session started from no longer exists (history rewritten and
+        # pruned): comparing with HEAD instead would hide whatever was committed since.
+        diff_base_gone = tripwires._finding(
+            "guard_degraded",
+            "high",
+            "the commit this session started from is gone; the diff scans cannot see what "
+            "was committed since",
+            base_head[:12],
+        )
+    else:
+        diff_base_gone = None
     diff_findings = [
         finding
-        for finding in tripwires.scan_git_diff(paths, directory)
+        for finding in tripwires.scan_git_diff(paths, directory, base_head, deadline)
         if not _already_recorded(finding, events)
     ]
     diff_findings += [
@@ -1246,9 +1497,11 @@ def _pre_verify(
     if directory:
         diff_findings += [
             finding
-            for finding in tripwires.scan_monitoring_diff(directory)
+            for finding in tripwires.scan_monitoring_diff(directory, base_head, deadline)
             if not _already_recorded(finding, events)
         ]
+    if diff_base_gone is not None:
+        diff_findings.append(diff_base_gone)
     diff_findings = _allowlisted(diff_findings, directory, led)
     if diff_findings:
         _log_check(
@@ -1831,6 +2084,20 @@ def _parse_json(text: str) -> Optional[Dict[str, Any]]:
 _NOTICE_HEADER = "[ysk-watch] Not resolved when this answer was sent:"
 
 
+def _bounded_check_fingerprint() -> Any:
+    """A fingerprint function sharing one ``_CHECK_BUDGET_S`` deadline, memoized per root."""
+    deadline = time.monotonic() + _CHECK_BUDGET_S
+    seen: Dict[str, Optional[Dict[str, Any]]] = {}
+
+    def fingerprint(where: Optional[str]) -> Optional[Dict[str, Any]]:
+        key = where or ""
+        if key not in seen:
+            seen[key] = evidence.fingerprint(where, deadline=deadline)
+        return seen[key]
+
+    return fingerprint
+
+
 def _final_notice(key_id: str, session_id: str, text: str) -> Optional[str]:
     cfg = _apply_rules()
     if not cfg.get("final_notice", True) or _honest_exit(text):
@@ -1846,7 +2113,7 @@ def _final_notice(key_id: str, session_id: str, text: str) -> Optional[str]:
         c
         for c in (
             _unverified_claim(text, events),
-            _stale_test_evidence(text, events, roots),
+            _stale_test_evidence(text, events, roots, _bounded_check_fingerprint()),
             _truncated_claim(text, events),
         )
         if c and c.get("severity") == "high"
@@ -1911,6 +2178,7 @@ def _on_transform_llm_output(
 
 
 def register(ctx) -> None:
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("pre_verify", _on_pre_verify)
     ctx.register_hook("transform_llm_output", _on_transform_llm_output)

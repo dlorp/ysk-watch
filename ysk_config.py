@@ -21,7 +21,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -294,17 +293,14 @@ def _committed_allowlist(repo_root: str) -> Tuple[str, str]:
     """
 
     def run(args: List[str]) -> str:
+        # Through the watcher's hardened git: a root-owned binary when PATH's is the agent's
+        # to rewrite, and no ``git replace`` substitution of the allowlist blob.
         try:
-            proc = subprocess.run(
-                ["git", "-C", repo_root, *args],
-                capture_output=True,
-                text=True,
-                timeout=_GIT_SHOW_TIMEOUT_S,
-                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-            )
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return ""
-        return proc.stdout if proc.returncode == 0 else ""
+            from . import evidence
+        except ImportError:  # loaded as a top-level module
+            import evidence  # type: ignore[no-redef]
+        ok, out = evidence._run_git(repo_root, args, timeout=_GIT_SHOW_TIMEOUT_S)
+        return out if ok else ""
 
     blob = run(["rev-parse", "--verify", "-q", f"HEAD:{ALLOWLIST_FILE}"]).strip()
     if not blob:

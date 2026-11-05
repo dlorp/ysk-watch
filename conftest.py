@@ -24,3 +24,12 @@ except ImportError:  # pragma: no cover - exercised in CI
     stub.get_hermes_home = get_hermes_home
     stub.hermes_home_key = hermes_home_key
     sys.modules["hermes_constants"] = stub
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_stat_cache(tmp_path, monkeypatch):
+    """The fingerprint's stat cache lives under the test's own tmp directory."""
+    monkeypatch.setenv("YSK_WATCH_CACHE_DIR", str(tmp_path / "ysk-stat-cache"))
