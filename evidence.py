@@ -12,6 +12,11 @@ run, and nothing parsed here turns an unknown outcome into a pass.
 
 Every call here is read-only for the repository, bounded by a timeout, and returns
 ``None``/empty on any error.
+
+The repository is also the watched agent's to configure, and git reads its config on every
+call. Settings that would make git report less than is on disk, or run a program while the
+tree is read, are overridden from the command line (which outranks every config file), and
+files the index has been told to stop looking at are looked at anyway.
 """
 
 from __future__ import annotations
@@ -42,6 +47,46 @@ _SWEEP_MAX_REMOVALS = 50
 _last_sweep = 0.0
 _MAX_REPORT_BYTES = 8 * 1024 * 1024
 
+# Config that changes what git reports about the working tree, or runs a program while it is
+# read. ``core.fsmonitor`` names a program that answers "what changed?"; the untracked cache is
+# index data that can list nothing; ``core.ignoreStat`` marks every file assume-unchanged;
+# ``checkStat=minimal``, ``trustctime=false`` and ``fileMode=false`` let an edit that keeps
+# size and mtime, or only flips the exec bit, look clean. Hooks (``post-index-change`` fires on
+# the throwaway index) and promisor-remote fetches would run programs the repository names.
+_HARDENED_CONFIG: Tuple[Tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("core.untrackedCache", "false"),
+    ("core.ignoreStat", "false"),
+    ("core.checkStat", "default"),
+    ("core.trustctime", "true"),
+    ("core.fileMode", "true"),
+    # A planted split index would make ``update-index`` on the throwaway index write a
+    # ``sharedindex.*`` file into the real ``.git``.
+    ("core.splitIndex", "false"),
+    ("core.hooksPath", os.devnull),
+    ("protocol.allow", "never"),
+)
+# Environment with the same purpose: no lazy fetch of missing objects from a promisor remote
+# (``GIT_NO_LAZY_FETCH`` is honored from 2.39.4/2.45), an empty transport allow-list that
+# outranks any ``protocol.<name>.allow`` in the repository's config, and no ``git replace``
+# substitution of one object for another.
+_HARDENED_ENV = {
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_ALLOW_PROTOCOL": "",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
+# Removed from every environment, inherited or passed: ``-c`` settings outrank the overrides,
+# and the pathspec switches would change what ``:(literal)`` names match or make git refuse
+# the literal pathspecs the diff scans use.
+_STRIPPED_ENV = (
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_COMMON_DIR",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
+
 # Docs by extension only. A directory name says nothing about what is in it: ``src/docs/``
 # can hold code, and ``requirements.txt`` changes what the tests run against.
 _DOC_PATH_RE = re.compile(r"\.(?:md|markdown|rst|adoc)$", re.IGNORECASE)
@@ -52,6 +97,48 @@ def is_doc(path: str) -> bool:
     return bool(path) and bool(_DOC_PATH_RE.search(path))
 
 
+def hardened_env(
+    env: Optional[Dict[str, str]] = None, extra: Tuple[Tuple[str, str], ...] = ()
+) -> Dict[str, str]:
+    """An environment for a read-only git call that repository config cannot steer.
+
+    The overrides go in through ``GIT_CONFIG_COUNT`` rather than ``-c``: a key and its value
+    travel separately, so a filter named ``a=b`` cannot be misparsed, and git passes them on
+    to the processes it starts for submodules. ``GIT_CONFIG_COUNT`` entries already in the
+    environment are kept; these come after them and so win.
+    """
+    if env is None:
+        run_env = dict(os.environ)
+        # Inherited settings that would point git at another repository or index. A caller
+        # that passes ``env`` sets these on purpose (the fingerprint's throwaway index).
+        for name in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ):
+            run_env.pop(name, None)
+    else:
+        run_env = dict(env)
+    for name in _STRIPPED_ENV:
+        run_env.pop(name, None)
+    # ``git status`` refreshes the real index opportunistically and takes ``index.lock`` to
+    # do it; without this, a watcher read could make the agent's own ``git add`` fail.
+    run_env["GIT_OPTIONAL_LOCKS"] = "0"
+    run_env.update(_HARDENED_ENV)
+    try:
+        count = max(0, int(run_env.get("GIT_CONFIG_COUNT") or 0))
+    except ValueError:
+        count = 0
+    for key, value in (*_HARDENED_CONFIG, *extra):
+        run_env[f"GIT_CONFIG_KEY_{count}"] = key
+        run_env[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    run_env["GIT_CONFIG_COUNT"] = str(count)
+    return run_env
+
+
 def _run_git(
     directory: Optional[str],
     args: List[str],
@@ -59,12 +146,10 @@ def _run_git(
     env: Optional[Dict[str, str]] = None,
     timeout: float = _GIT_TIMEOUT_S,
     input: Optional[str] = None,
+    extra_config: Tuple[Tuple[str, str], ...] = (),
 ) -> Tuple[bool, str]:
     here = directory or os.getcwd()
-    # ``git status`` refreshes the real index opportunistically and takes ``index.lock`` to
-    # do it; without this, a watcher read could make the agent's own ``git add`` fail.
-    run_env = dict(env if env is not None else os.environ)
-    run_env["GIT_OPTIONAL_LOCKS"] = "0"
+    run_env = hardened_env(env, extra_config)
     try:
         proc = subprocess.run(
             ["git", "-C", here, *args],
@@ -93,14 +178,30 @@ def repo_root(directory: Optional[str]) -> Optional[str]:
     return root or None
 
 
-def _status_paths(directory: Optional[str], *, include_sources: bool = False) -> List[str]:
+def _status_paths(
+    directory: Optional[str],
+    *,
+    include_sources: bool = False,
+    extra_config: Tuple[Tuple[str, str], ...] = (),
+    timeout: float = _GIT_TIMEOUT_S,
+) -> Optional[List[str]]:
     """Paths that differ from HEAD (staged, unstaged or untracked), root-relative.
 
     ``-z`` output, so names with spaces, quotes or non-ASCII bytes come back verbatim instead
     of C-quoted. A rename or copy entry is followed by its source path, which is skipped:
-    the destination is the file that exists now.
+    the destination is the file that exists now. A submodule is compared by its commit
+    (``--ignore-submodules=dirty``), whatever
+    ``submodule.<name>.ignore`` says. ``None`` when git fails or times out: an empty list
+    would say the tree matches HEAD.
     """
-    raw = git(directory, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    ok, raw = _run_git(
+        directory,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty"],
+        extra_config=extra_config,
+        timeout=timeout,
+    )
+    if not ok:
+        return None
     parts = raw.split("\0")
     names: List[str] = []
     index = 0
@@ -125,7 +226,13 @@ def _status_paths(directory: Optional[str], *, include_sources: bool = False) ->
 
 def changed_paths(directory: Optional[str]) -> List[str]:
     """Every path the working tree differs from HEAD on, tracked or untracked, capped."""
-    return _status_paths(directory)[:_MAX_LISTED_PATHS]
+    root = repo_root(directory)
+    if not root:
+        return []
+    filters = filter_overrides(root)
+    if filters is None:
+        return []
+    return (_status_paths(root, extra_config=filters) or [])[:_MAX_LISTED_PATHS]
 
 
 # Never source, and rewritten by any Python or Node run: a repository that does not ignore
@@ -159,6 +266,130 @@ def _git_path(root: str, name: str) -> Optional[str]:
     if not value:
         return None
     return value if os.path.isabs(value) else os.path.join(root, value)
+
+
+def filter_overrides(root: str) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Config that turns off every filter driver and config-defined hook, git-lfs included.
+
+    A clean filter is a program git runs on a file's content before hashing it, and the
+    repository chooses both the program (``filter.<name>.clean`` in ``.git/config``) and the
+    files it applies to (``.gitattributes``). Run, it could make an edited file hash like the
+    original. With the driver's commands empty and ``required`` off, the raw file is hashed,
+    the same way on both sides of a comparison.
+
+    From git 2.54 a hook can also be defined in config (``hook.<name>.command`` and
+    ``.event``), which ``core.hooksPath`` does not reach. Each such name is disabled and
+    stripped of its events. Older git ignores the keys.
+
+    ``None`` when the config cannot be read:
+    ``--get-regexp`` also fails when no key matches, so a failure counts only when listing
+    the config fails too.
+    """
+    ok, raw = _run_git(root, ["config", "-z", "--get-regexp", r"^(filter|hook)\..*\."])
+    if not ok:
+        listed, _ = _run_git(root, ["config", "--list"])
+        if not listed:
+            return None
+        raw = ""
+    names = {"lfs"}
+    hooks = set()
+    for entry in raw.split("\0"):
+        key = entry.split("\n", 1)[0]
+        section, _, rest = key.partition(".")
+        if "." not in rest:
+            continue
+        name = rest[: rest.rindex(".")]
+        if section == "filter":
+            names.add(name)
+        elif section == "hook":
+            hooks.add(name)
+    overrides: List[Tuple[str, str]] = []
+    for name in sorted(names):
+        overrides += [
+            (f"filter.{name}.clean", ""),
+            (f"filter.{name}.process", ""),
+            (f"filter.{name}.required", "false"),
+        ]
+    for name in sorted(hooks):
+        overrides += [(f"hook.{name}.enabled", "false"), (f"hook.{name}.event", "")]
+    return tuple(overrides)
+
+
+def _global_excludes_file(root: str) -> Optional[str]:
+    """The user's own excludes file: ``core.excludesFile`` from the global config, else git's
+    default location. A repository-level setting is not consulted."""
+    ok, value = _run_git(root, ["config", "--global", "--path", "--get", "core.excludesFile"])
+    path = value.strip() if ok else ""
+    if not path:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+        path = os.path.join(base, "git", "ignore")
+    return path if os.path.isfile(path) else None
+
+
+def _hidden_paths(
+    root: str, extra_config: Tuple[Tuple[str, str], ...]
+) -> Optional[Tuple[List[str], List[str]]]:
+    """Paths ``git status`` can be told not to report, as ``(flagged, untracked)``.
+
+    ``flagged``: tracked files marked assume-unchanged or skip-worktree that exist on disk.
+    Status trusts the mark and never looks at them. A skip-worktree file that is absent is
+    an ordinary sparse checkout and is left alone.
+
+    ``untracked``: untracked files, honoring ``.gitignore`` files and the user's global
+    excludes file but not ``.git/info/exclude`` or a repository-level ``core.excludesFile``.
+    Those two live in the repository's private, unreviewed state, so a rule there could hide
+    a new source file without any tracked file changing. An untracked nested repository
+    (listed as ``dir/``, such as a tool's worktree under ``.claude/worktrees/``) is left out:
+    git would record only its commit id, and it is a repository of its own, fingerprinted on
+    its own when the session works there.
+
+    ``None`` when either listing fails: a partial list would name a tree that does not exist.
+    """
+    ok, raw = _run_git(root, ["ls-files", "-v", "-z"], timeout=_STAGE_TIMEOUT_S)
+    if not ok:
+        return None
+    flagged: List[str] = []
+    for entry in raw.split("\0"):
+        if len(entry) < 3:
+            continue
+        tag, path = entry[0], entry[2:]
+        # ``m`` is an unmerged entry: status reports it already, and update-index cannot
+        # clear a mark on it.
+        if (
+            tag != "m"
+            and (tag.islower() or tag == "S")
+            and os.path.lexists(os.path.join(root, path))
+        ):
+            flagged.append(path)
+    args = ["ls-files", "-z", "--others", "--exclude-per-directory=.gitignore"]
+    excludes = _global_excludes_file(root)
+    if excludes:
+        args.append(f"--exclude-from={excludes}")
+    ok, raw = _run_git(root, args, timeout=_STAGE_TIMEOUT_S, extra_config=extra_config)
+    if not ok:
+        return None
+    return flagged, [path for path in raw.split("\0") if path and not path.endswith("/")]
+
+
+def _within(directory: Optional[str], root: str) -> bool:
+    """Whether ``directory`` lies inside the working tree git reported for it.
+
+    ``core.worktree`` in a repository's config points git at another directory, so the tree
+    read would not be the one the agent works in.
+    """
+    here = os.path.realpath(directory or os.getcwd())
+    # Walk up rather than compare strings: on a case-insensitive filesystem the agent's cwd
+    # and git's toplevel can name the same directory in different case.
+    while True:
+        try:
+            if os.path.samefile(here, root):
+                return True
+        except OSError:
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
 
 
 def _sweep_stale_temp_dirs(now: Optional[float] = None) -> int:
@@ -211,19 +442,23 @@ def tree_fingerprint(
 
     The whole working tree (tracked changes and untracked, non-ignored files) is staged into
     a throwaway index whose new objects go to a throwaway object directory, and the tree id
-    of that index is the fingerprint. The repository's own index and object store are only
-    read. The name therefore depends on file contents and nothing else: ``git add`` and
+    of that index is the fingerprint. Files marked assume-unchanged or skip-worktree are
+    hashed from disk all the same, ``.git/info/exclude`` does not hide a file, and no filter
+    driver, fsmonitor hook or index cache the repository configures is used (see
+    ``_hidden_paths`` and ``filter_overrides``). The repository's own index and object store
+    are only read. The name therefore depends on file contents and nothing else: ``git add`` and
     ``git commit`` after a green run leave it unchanged, while any content change, however
     it was made, changes it. Nothing is truncated and no file is named by size or mtime.
 
     Prose files (``.md``, ``.rst``, ``.adoc``) are reset to their HEAD version first, so a
     README edit after a green run is not stale evidence.
 
-    Returns ``None`` outside a repository, before the first commit, or when git fails or
-    times out. Callers decide what an unknown tree means; this function never guesses.
+    Returns ``None`` outside a repository, before the first commit, when the repository's
+    config points git at another working tree, or when git fails or times out. Callers
+    decide what an unknown tree means; this function never guesses.
     """
     root = repo_root(directory)
-    if not root:
+    if not root or not _within(directory, root):
         return None
     head = git(root, ["rev-parse", "HEAD"]).strip()
     if not head:
@@ -232,11 +467,30 @@ def tree_fingerprint(
     objects_path = _git_path(root, "objects")
     if not objects_path:
         return None
-    paths = [
-        path
-        for path in _status_paths(root, include_sources=True)
-        if not _CACHE_PATH_RE.search(path)
-    ]
+    filters = filter_overrides(root)
+    if filters is None:
+        return None
+    status = _status_paths(
+        root, include_sources=True, extra_config=filters, timeout=_STAGE_TIMEOUT_S
+    )
+    if status is None:
+        return None
+    hidden = _hidden_paths(root, filters)
+    if hidden is None:
+        return None
+    flagged, untracked = hidden
+    listed: List[str] = []
+    seen = set()
+    for path in (
+        *status,
+        *flagged,
+        *untracked,
+    ):
+        if path not in seen:
+            seen.add(path)
+            listed.append(path)
+    paths = [path for path in listed if not _CACHE_PATH_RE.search(path)]
+    flagged = [path for path in flagged if path in paths]
     docs = [path for path in paths if is_doc(path)] if not include_docs else []
     code_paths = [path for path in paths if path not in docs]
     try:
@@ -265,49 +519,55 @@ def tree_fingerprint(
                 except OSError:
                     copied = False
             if not copied:
-                ok, _ = _run_git(root, ["read-tree", "HEAD"], env=env)
+                ok, _ = _run_git(root, ["read-tree", "HEAD"], env=env, extra_config=filters)
                 if not ok:
                     return None
+            elif flagged:
+                # The copied index still carries the marks, and ``update-index`` leaves a
+                # skip-worktree entry alone even when it is named. Clear them in the copy.
+                for mark in ("--no-assume-unchanged", "--no-skip-worktree"):
+                    ok, _ = _run_git(
+                        root,
+                        ["update-index", mark, "-z", "--stdin"],
+                        env=env,
+                        timeout=_STAGE_TIMEOUT_S,
+                        input="".join(path + "\0" for path in flagged),
+                        extra_config=filters,
+                    )
+                    if not ok:
+                        return None
             # Each changed path's object id goes into the throwaway index without the object
             # being written (``--info-only``): the tree id is the one ``git add -A`` would
             # produce, but no file content is copied into the temp directory, so a large
-            # untracked file costs one read rather than its size on disk. Clean filters run
-            # when a file is hashed; git-lfs's writes into the real ``.git/lfs``, so the raw
-            # file is hashed instead, consistently on both sides of a comparison.
+            # untracked file costs one read rather than its size on disk. Filter drivers are
+            # off (``filter_overrides``): the raw file is hashed.
             # One process reads every path from stdin: a single index write and a single
             # timeout however many paths changed.
             if paths:
                 ok, _ = _run_git(
                     root,
-                    [
-                        "-c",
-                        "filter.lfs.clean=",
-                        "-c",
-                        "filter.lfs.process=",
-                        "-c",
-                        "filter.lfs.required=false",
-                        "update-index",
-                        "--add",
-                        "--remove",
-                        "--info-only",
-                        "-z",
-                        "--stdin",
-                    ],
+                    ["update-index", "--add", "--remove", "--info-only", "-z", "--stdin"],
                     env=env,
                     timeout=_STAGE_TIMEOUT_S,
                     input="".join(path.rstrip("/") + "\0" for path in paths),
+                    extra_config=filters,
                 )
                 if not ok:
                     return None
             for start in range(0, len(docs), _PATHSPEC_CHUNK):
                 chunk = docs[start : start + _PATHSPEC_CHUNK]
                 ok, _ = _run_git(
-                    root, ["reset", "-q", "HEAD", "--", *[f":(literal){p}" for p in chunk]], env=env
+                    root,
+                    ["reset", "-q", "HEAD", "--", *[f":(literal){p}" for p in chunk]],
+                    env=env,
+                    extra_config=filters,
                 )
                 if not ok:
                     return None
             # The blobs hashed above were never written; trees are, and they are small.
-            ok, tree = _run_git(root, ["write-tree", "--missing-ok"], env=env)
+            # write-tree re-hashes a racily clean entry (one written in the same second as
+            # the index), so the filter overrides apply here too, as to every call above.
+            ok, tree = _run_git(root, ["write-tree", "--missing-ok"], env=env, extra_config=filters)
             tree = tree.strip()
             if not ok or not tree:
                 return None
@@ -405,7 +665,10 @@ def dir_fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
                 info = item.stat()
             except OSError:
                 continue
-            entries.append(f"{relative}\0{info.st_size}\0{info.st_mtime_ns}")
+            # ctime and inode too: mtime can be set back by hand, ctime cannot.
+            entries.append(
+                f"{relative}\0{info.st_size}\0{info.st_mtime_ns}\0{info.st_ctime_ns}\0{info.st_ino}"
+            )
             if len(entries) > _DIR_MAX_FILES:
                 return None
     digest = hashlib.sha256("\n".join(sorted(entries)).encode("utf-8", "replace")).hexdigest()
@@ -426,7 +689,24 @@ def fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     if repo_root(directory):
         return tree_fingerprint(directory)
+    if shutil.which("git") and _inside_git_metadata_tree(directory):
+        # A repository git refuses to read (an unknown format version or extension, a
+        # planted ``core.bare``) is not a plain directory: no weaker name stands in for it.
+        # Without git installed at all, the directory rule applies everywhere, as documented.
+        return None
     return dir_fingerprint(directory)
+
+
+def _inside_git_metadata_tree(directory: str) -> bool:
+    """Whether ``directory`` or any parent holds a ``.git`` entry."""
+    here = os.path.realpath(directory)
+    while True:
+        if os.path.lexists(os.path.join(here, ".git")):
+            return True
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
 
 
 def snapshot(
@@ -441,8 +721,18 @@ def snapshot(
     if fingerprint is None:
         return None
     root = fingerprint["root"]
-    diffstat = git(root, ["diff", "--stat", "HEAD"])[:2000]
-    status = git(root, ["status", "--short"])[:2000]
+    filters = filter_overrides(root) or ()
+    _, diffstat = _run_git(
+        root,
+        ["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"],
+        extra_config=filters,
+    )
+    _, status = _run_git(
+        root,
+        ["status", "--short", "--untracked-files=all", "--ignore-submodules=dirty"],
+        extra_config=filters,
+    )
+    diffstat, status = diffstat[:2000], status[:2000]
     return {
         "tree": fingerprint["hash"],
         "head": fingerprint["head"],

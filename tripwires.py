@@ -433,13 +433,15 @@ def _monitoring_findings(
 def scan_monitoring_diff(directory: Optional[str] = None) -> List[Finding]:
     """``monitoring_weakened`` over the working tree against HEAD, however the edit was made."""
     names = [
-        line.strip()
-        for line in _git_output(directory, ["diff", "--name-only", "HEAD"]).splitlines()
-        if line.strip() and not is_doc_path(line.strip())
+        name
+        for name in _git_output(
+            directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", "HEAD"]
+        ).split("\0")
+        if name and not is_doc_path(name)
     ][:_MAX_DIFF_PATHS]
     if not names:
         return []
-    diff = _git_output(directory, ["diff", "-U0", "HEAD", "--", *names])
+    diff = _git_output(directory, ["diff", *_DIFF_FLAGS, "-U0", "HEAD", "--", *names])
     findings: List[Finding] = []
     for chunk in re.split(r"(?m)^(?=diff --git )", diff):
         path = diff_path(chunk)
@@ -904,24 +906,26 @@ def _split_tokens(args: str) -> List[str]:
         return args.split()
 
 
-def _resolve_remote_url(directory: str, remote: str) -> Optional[str]:
-    """Read-only ``git remote get-url``; no network, bounded, every error swallowed."""
+def _resolve_push_urls(directory: str, remote: str) -> List[str]:
+    """Every URL a push to ``remote`` goes to: ``git remote get-url --push --all``.
+
+    The push URLs, not the fetch URL: ``remote.<name>.pushurl`` and ``url.<base>.pushInsteadOf``
+    send a push somewhere other than where fetches come from, and a push goes to every
+    ``pushurl``. Read-only, no network, bounded; empty on any error.
+    """
     try:
         proc = subprocess.run(
-            ["git", "-C", directory, "remote", "get-url", remote],
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            ["git", "-C", directory, "remote", "get-url", "--push", "--all", remote],
+            env=evidence.hardened_env(),
             capture_output=True,
             text=True,
             timeout=_REMOTE_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return []
     if proc.returncode != 0:
-        return None
-    for line in (proc.stdout or "").splitlines():
-        if line.strip():
-            return line.strip()
-    return None
+        return []
+    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
 
 
 def _is_filesystem_remote(target: str) -> bool:
@@ -1137,7 +1141,7 @@ def _current_branch(directory: Optional[str]) -> Optional[str]:
         try:
             proc = subprocess.run(
                 ["git", "-C", here, *args],
-                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+                env=evidence.hardened_env(),
                 capture_output=True,
                 text=True,
                 timeout=_REMOTE_TIMEOUT_S,
@@ -1238,10 +1242,10 @@ def _push_lands_on_a_forge(directory: Optional[str], remote: Optional[str]) -> b
         if _is_forge_remote(remote):
             return True
     here = directory or os.getcwd()
-    url = _resolve_remote_url(here, remote or _PUSH_DEFAULT_REMOTE)
-    if not url:
+    urls = _resolve_push_urls(here, remote or _PUSH_DEFAULT_REMOTE)
+    if not urls:
         return True
-    return not _is_filesystem_remote(url)
+    return not all(_is_filesystem_remote(url) for url in urls)
 
 
 # --- destructive commands graded by target --------------------------------------------
@@ -1571,14 +1575,39 @@ def _attribution_finding(command: str) -> Optional[Finding]:
 
 _GIT_TIMEOUT_S = 5.0
 _MAX_DIFF_PATHS = 20
+# ``diff.external`` and a ``textconv`` driver are programs the repository names; either would
+# decide what the scanned diff says. Plain text diffs only, and only of real content.
+# Fixed by flag, whatever the repository's diff config or attributes say: the ``a/``/``b/``
+# prefixes ``diff_path`` reads, the whole tree rather than ``diff.relative``'s subdirectory,
+# and text even for a path marked ``-diff`` or ``binary``.
+_DIFF_FLAGS = (
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-color",
+    "--ignore-submodules=dirty",
+    "--submodule=short",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--no-relative",
+    "--text",
+)
 
 
 def _git_output(directory: Optional[str], args: List[str]) -> str:
-    here = directory or os.getcwd()
+    # From the top of the working tree: ``--name-only`` prints root-relative paths, and they
+    # come back here as pathspecs, which git reads relative to the directory it runs in.
+    here = evidence.repo_root(directory) or directory or os.getcwd()
     try:
+        # Filter drivers run when a racily clean file is re-hashed for a diff, and paths taken
+        # from the diff are passed back as literal names, not pathspec magic or globs.
+        filters = evidence.filter_overrides(here)
+        if filters is None:
+            return ""
+        env = evidence.hardened_env(extra=filters)
+        env["GIT_LITERAL_PATHSPECS"] = "1"
         proc = subprocess.run(
             ["git", "-C", here, *args],
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env=env,
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -1637,12 +1666,12 @@ def scan_git_diff(
     if paths:
         candidates = [str(path) for path in paths if _is_test_path(str(path))]
     else:
-        listing = _git_output(directory, ["diff", "--name-only", "HEAD"])
-        candidates = [line.strip() for line in listing.splitlines() if _is_test_path(line)]
+        listing = _git_output(directory, ["diff", *_DIFF_FLAGS, "--name-only", "-z", "HEAD"])
+        candidates = [name for name in listing.split("\0") if name and _is_test_path(name)]
     candidates = candidates[:_MAX_DIFF_PATHS]
     if not candidates:
         return []
-    diff = _git_output(directory, ["diff", "HEAD", "--", *candidates])
+    diff = _git_output(directory, ["diff", *_DIFF_FLAGS, "HEAD", "--", *candidates])
     if not diff.strip():
         return []
     return scan_diff(diff, ", ".join(candidates))
@@ -1796,6 +1825,14 @@ def _test_evidence(
             event["tree_root"] = tree["root"]
             event["head"] = tree["head"]
             event["tree_paths"] = tree["paths"]
+        elif passed is True and run_dir:
+            # A green run in a repository whose tree could not be read describes no known
+            # tree. Recorded as such, so a later claim is told the evidence is unavailable
+            # instead of the run quietly covering nothing.
+            unread_root = evidence.repo_root(run_dir)
+            if unread_root:
+                event["tree_root"] = unread_root
+                event["tree_unavailable"] = True
         events.append(event)
     return events
 

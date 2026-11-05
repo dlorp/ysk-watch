@@ -580,3 +580,36 @@ def test_a_tripwire_crash_is_recorded_as_guard_degraded(ysk, monkeypatch):
     _run(ysk, "ls", 0)
     log = (ysk._home() / "logs" / "ysk-watch" / "checks.jsonl").read_text(encoding="utf-8")
     assert "guard_degraded" in log
+
+
+def test_push_to_a_mirror_whose_push_url_is_a_forge_is_flagged(ysk, tmp_path):
+    """Fetches come from the LAN mirror, pushes go to the forge: the push URL decides."""
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "bare.git"))
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@github.com:dlorp/example.git",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    _cmd(ysk, f"cd {repo} && git push origin main")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_push_to_a_mirror_with_a_second_forge_push_url_is_flagged(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "bare.git"))
+    for url in (str(tmp_path / "bare.git"), "https://github.com/dlorp/example.git"):
+        subprocess.run(
+            ["git", "-C", str(repo), "remote", "set-url", "--add", "--push", "origin", url],
+            check=True,
+            capture_output=True,
+        )
+    _cmd(ysk, f"cd {repo} && git push origin main")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))

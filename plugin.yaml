@@ -1,7 +1,7 @@
 name: ysk-watch
 label: ysk-watch
 kind: standalone
-version: "0.6.1"
+version: "0.7.0"
 description: >-
   Integrity watcher for orchestrator agents, their subagents and task workers, and agents
   working with a human. Deterministic tripwires on every tool call (tests weakened, monitoring
