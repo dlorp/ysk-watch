@@ -681,8 +681,7 @@ def test_push_all_with_a_local_main_is_flagged_and_without_one_is_not(ysk, tmp_p
     _cmd(ysk, f"cd {repo} && git push --all origin")
     assert _high(ysk) == []
     (repo / "x.txt").write_text("x\n")
-    _git(repo, "add", "x.txt")
-    _git(repo, "commit", "-qm", "x")
+    _commit(repo)
     _git(repo, "branch", "main")
     _cmd(ysk, f"cd {repo} && git push --all origin", session="s2")
     assert any(e["category"] == "forge_push_guard" for e in _high(ysk, "s2"))
