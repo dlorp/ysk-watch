@@ -1,7 +1,7 @@
 name: ysk-watch
 label: ysk-watch
 kind: standalone
-version: "0.7.0"
+version: "0.8.0"
 description: >-
   Integrity watcher for orchestrator agents, their subagents and task workers, and agents
   working with a human. Deterministic tripwires on every tool call (tests weakened, monitoring
@@ -13,6 +13,7 @@ author: "dlorp"
 license: MIT
 requires_hermes: ">=0.21.5"
 provides_hooks:
+  - pre_tool_call
   - post_tool_call
   - pre_verify
   - transform_llm_output

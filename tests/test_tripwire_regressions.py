@@ -585,3 +585,116 @@ def test_force_with_lease_on_a_feature_branch_is_not_high(ysk):
 def test_a_plain_force_push_is_still_high(ysk):
     _cmd(ysk, "git push --force origin fix/capture-integrity")
     assert any(e["category"] == "destructive_cmd" for e in _high(ysk))
+
+
+# --- 0.8.0: a bare push resolves its remote and destination as git does ------------------------
+
+
+def test_bare_push_follows_remote_push_default_to_a_forge(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "mirror.git"))
+    _git(repo, "remote", "add", "forge", "git@github.com:dlorp/example.git")
+    _git(repo, "config", "remote.pushDefault", "forge")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_bare_push_follows_the_branch_push_remote_to_a_forge(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "mirror.git"))
+    branch = _git(repo, "symbolic-ref", "--short", "HEAD")
+    _git(repo, "remote", "add", "forge", "https://github.com/dlorp/example.git")
+    _git(repo, "config", f"branch.{branch}.pushRemote", "forge")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_bare_push_to_a_filesystem_mirror_is_still_fine(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "mirror.git"))
+    _cmd(ysk, f"cd {repo} && git push")
+    assert _high(ysk) == []
+
+
+def test_bare_push_from_a_feature_branch_whose_upstream_is_main_is_flagged(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git", branch="feature/x")
+    _git(repo, "config", "push.default", "upstream")
+    _git(repo, "config", "branch.feature/x.remote", "origin")
+    _git(repo, "config", "branch.feature/x.merge", "refs/heads/main")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_bare_push_with_push_default_nothing_pushes_nothing(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git")
+    _git(repo, "config", "push.default", "nothing")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert _high(ysk) == []
+
+
+@pytest.mark.parametrize(
+    "push",
+    [
+        "git push --mirror origin",
+        "git push origin :",
+        "git push origin 'refs/heads/*:refs/heads/*'",
+        "git -c remote.origin.pushurl=git@github.com:dlorp/x.git push origin feature",
+        "GIT_CONFIG_COUNT=1 git push origin feature",
+    ],
+)
+def test_push_shapes_that_reach_main_on_a_forge_are_flagged(ysk, tmp_path, push):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "mirror.git"), branch="feature")
+    _git(repo, "remote", "add", "forge", "git@github.com:dlorp/example.git")
+    _git(repo, "remote", "set-url", "origin", "git@github.com:dlorp/example.git")
+    _cmd(ysk, f"cd {repo} && {push}")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_a_remote_push_refspec_to_main_is_flagged(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git", branch="feature")
+    _git(repo, "config", "remote.origin.push", "HEAD:refs/heads/main")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_a_mirror_remote_is_flagged(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git", branch="feature")
+    _git(repo, "config", "remote.origin.mirror", "true")
+    _cmd(ysk, f"cd {repo} && git push")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_a_path_rewritten_to_a_forge_by_insteadof_is_flagged(ysk, tmp_path):
+    mirror = str(tmp_path / "mirror.git")
+    repo = _git_repo(tmp_path / "repo", mirror)
+    _git(repo, "config", "url.git@github.com:dlorp/example.git.insteadOf", mirror)
+    _cmd(ysk, f"cd {repo} && git push {mirror} main")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_a_push_repo_option_names_the_remote(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", str(tmp_path / "mirror.git"))
+    _git(repo, "remote", "add", "forge", "git@github.com:dlorp/example.git")
+    _cmd(ysk, f"cd {repo} && git push --repo=forge")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))
+
+
+def test_push_all_with_a_local_main_is_flagged_and_without_one_is_not(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git", branch="feature")
+    _cmd(ysk, f"cd {repo} && git push --all origin")
+    assert _high(ysk) == []
+    (repo / "x.txt").write_text("x\n")
+    _commit(repo)
+    _git(repo, "branch", "main")
+    _cmd(ysk, f"cd {repo} && git push --all origin", session="s2")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk, "s2"))
+
+
+def test_a_glob_that_cannot_match_main_is_not_flagged(ysk, tmp_path):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git", branch="feature/x")
+    _cmd(ysk, f"cd {repo} && git push origin 'refs/heads/feature/*:refs/heads/feature/*'")
+    assert _high(ysk) == []
+
+
+@pytest.mark.parametrize("option", ["-o ci.skip", "--push-option ci.skip", "--receive-pack /x"])
+def test_a_push_option_value_is_not_taken_for_the_remote(ysk, tmp_path, option):
+    repo = _git_repo(tmp_path / "repo", "git@github.com:dlorp/example.git")
+    _cmd(ysk, f"cd {repo} && git push {option} origin")
+    assert any(e["category"] == "forge_push_guard" for e in _high(ysk))

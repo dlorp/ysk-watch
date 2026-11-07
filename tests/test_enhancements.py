@@ -1540,11 +1540,15 @@ def test_marks_are_cleared_only_in_the_throwaway_index(ysk, repo):
     assert _git(repo, "ls-files", "-v", "src/calc.py").startswith("S ")
 
 
-def test_a_skip_worktree_file_absent_from_disk_is_a_sparse_checkout_not_a_deletion(ysk, repo):
+def test_a_planted_sparse_checkout_does_not_excuse_a_deletion(ysk, repo):
+    """``core.sparseCheckout`` is repository config the agent can set: it excuses nothing."""
+    _git(repo, "config", "core.sparseCheckout", "true")
     before = ysk.evidence.tree_fingerprint(str(repo))
     _git(repo, "update-index", "--skip-worktree", "tests/test_calc.py")
     (repo / "tests" / "test_calc.py").unlink()
-    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before["hash"]
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "tests/test_calc.py" in after["paths"]
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == after["hash"]
 
 
 def test_a_file_hidden_by_info_exclude_changes_the_fingerprint(ysk, repo):
@@ -1584,11 +1588,14 @@ def test_a_repository_pointing_git_at_another_worktree_has_no_fingerprint(ysk, r
     assert ysk.evidence.tree_fingerprint(str(repo)) is None
 
 
-def test_a_failed_status_is_no_fingerprint_not_a_clean_tree(ysk, repo, monkeypatch):
+@pytest.mark.parametrize(
+    "listing", [("ls-tree",), ("ls-files", "-s"), ("ls-files", "-z", "--others")]
+)
+def test_a_failed_listing_is_no_fingerprint_not_a_clean_tree(ysk, repo, monkeypatch, listing):
     real = ysk.evidence._run_git
 
     def failing(directory, args, **kwargs):
-        if args and args[0] == "status":
+        if tuple(args[: len(listing)]) == listing:
             return False, ""
         return real(directory, args, **kwargs)
 
@@ -1729,3 +1736,623 @@ def test_inherited_dash_c_and_pathspec_switches_are_removed_from_every_env(ysk, 
         assert "GIT_CONFIG_PARAMETERS" not in run_env
         assert "GIT_ICASE_PATHSPECS" not in run_env
         assert run_env["GIT_ALLOW_PROTOCOL"] == ""
+
+
+# --- 0.8.0: the index is not trusted, submodules and planted ignore files count -----------------
+
+
+def _forge_index_stat(repo: Path, path: str) -> None:
+    """Rewrite ``path``'s index entry with the file's current stat data, keeping its object id.
+
+    This is what an agent that wants git to call an edited file clean would write: status
+    compares stat data, sees a match, and never rehashes the file.
+    """
+    import hashlib as _hashlib
+    import struct
+
+    index = repo / ".git" / "index"
+    data = bytearray(index.read_bytes())
+    assert data[:4] == b"DIRC" and struct.unpack(">I", data[4:8])[0] == 2
+    count = struct.unpack(">I", data[8:12])[0]
+    info = (repo / path).stat()
+    offset = 12
+    for _ in range(count):
+        flags = struct.unpack(">H", data[offset + 60 : offset + 62])[0]
+        name_len = flags & 0xFFF
+        name = bytes(data[offset + 62 : offset + 62 + name_len]).decode()
+        if name == path:
+            fields = struct.pack(
+                ">IIIIIIIIII",
+                int(info.st_ctime),
+                info.st_ctime_ns % 1_000_000_000,
+                int(info.st_mtime),
+                info.st_mtime_ns % 1_000_000_000,
+                info.st_dev & 0xFFFFFFFF,
+                info.st_ino & 0xFFFFFFFF,
+                struct.unpack(">I", data[offset + 24 : offset + 28])[0],
+                info.st_uid,
+                info.st_gid,
+                info.st_size,
+            )
+            data[offset : offset + 40] = fields
+        entry_len = 62 + name_len
+        offset += (entry_len + 8) & ~7
+    body = bytes(data[:-20])
+    index.write_bytes(body + _hashlib.sha1(body).digest())
+
+
+def test_an_index_forged_to_call_an_edited_file_clean_does_not_hide_the_edit(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    calc = repo / "src" / "calc.py"
+    calc.write_text("def add(a, b):\n    return a - b\n")  # same size
+    time.sleep(1.1)  # the forged index must not be racily clean
+    _forge_index_stat(repo, "src/calc.py")
+    assert _git(repo, "status", "--porcelain") == ""  # git itself is fooled
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after and after["hash"] != before["hash"] and "src/calc.py" in after["paths"]
+
+
+def test_the_stat_cache_is_the_watchers_own(ysk, repo, tmp_path):
+    time.sleep(2.2)  # past the racy window: files just written are hashed again, not cached
+    ysk.evidence.tree_fingerprint(str(repo))
+    caches = list((tmp_path / "ysk-stat-cache").glob("*.json"))
+    assert len(caches) == 1
+    assert "src/calc.py" in json.loads(caches[0].read_text())["entries"]
+
+
+def test_a_cached_file_edited_with_mtime_and_size_restored_is_rehashed(ysk, repo, tmp_path):
+    calc = repo / "src" / "calc.py"
+    time.sleep(2.2)  # out of the racy window, so the first fingerprint caches calc.py
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (cache,) = (tmp_path / "ysk-stat-cache").glob("*.json")
+    assert "src/calc.py" in json.loads(cache.read_text())["entries"]
+    settled = calc.stat()
+    time.sleep(1.1)
+    calc.write_text("def add(a, b):\n    return a - b\n")
+    os.utime(calc, ns=(settled.st_atime_ns, settled.st_mtime_ns))
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_self_ignoring_gitignore_planted_beside_source_changes_the_fingerprint(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "src" / ".gitignore").write_text("*\n")
+    (repo / "src" / "helper.py").write_text("def add(a, b):\n    return 3\n")
+    assert "src" not in _git(repo, "status", "--porcelain", "--untracked-files=all")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "src/.gitignore" in after["paths"]
+
+
+def test_a_tools_own_self_ignoring_cache_directory_does_not_count(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    cache = repo / "scripts" / ".cache"
+    cache.mkdir(parents=True)
+    (cache / ".gitignore").write_text("*\n")
+    (cache / "blob").write_text("x\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == before["hash"]
+
+
+def test_an_uncommitted_edit_inside_a_submodule_changes_the_fingerprint(ysk, repo, tmp_path):
+    lib = tmp_path / "lib"
+    (lib).mkdir()
+    (lib / "lib.py").write_text("X = 1\n")
+    subprocess.run(["git", "init", "-q", str(lib)], check=True, capture_output=True)
+    _git(lib, "add", "-A")
+    _git(lib, "commit", "-q", "-m", "lib")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "vendor/lib")
+    _git(repo, "commit", "-q", "-m", "submodule")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    assert before is not None
+    (repo / "vendor" / "lib" / "lib.py").write_text("X = 2\n")
+    # The outer repository compares a submodule by its commit, which did not move.
+    assert _git(repo, "status", "--porcelain", "--ignore-submodules=dirty") == ""
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after and after["hash"] != before["hash"]
+
+
+def test_a_skip_worktree_mark_does_not_hide_a_deletion_outside_a_sparse_checkout(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    _git(repo, "update-index", "--skip-worktree", "src/calc.py")
+    (repo / "src" / "calc.py").unlink()
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "src/calc.py" in after["paths"]
+
+
+def test_files_with_converted_line_endings_read_as_changed_and_stay_stable(ysk, repo):
+    (repo / ".gitattributes").write_text("*.ps1 text eol=crlf\n")
+    (repo / "run.ps1").write_text("Write-Host one\nWrite-Host two\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "ps1")
+    (repo / "run.ps1").unlink()
+    _git(repo, "checkout", "--", "run.ps1")
+    first = ysk.evidence.tree_fingerprint(str(repo))
+    assert "run.ps1" in first["paths"]  # raw bytes, not git's converted view
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == first["hash"]
+
+
+def test_an_ident_attribute_does_not_mask_an_edit(ysk, repo):
+    """``ident`` collapses ``$Id: anything$`` to ``$Id$`` when git hashes: arbitrary code
+    inside the marker would hash like HEAD. The fingerprint hashes raw bytes."""
+    calc = repo / "src" / "calc.py"
+    calc.write_text('VERSION = "$Id$"\n\ndef add(a, b):\n    return a + b\n')
+    _git(repo, "commit", "-qam", "version marker")
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("*.py ident\n")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    calc.write_text(
+        'VERSION = "$Id: "; exec("add = lambda a, b: 3"); _ = "$"\n\n'
+        "def add(a, b):\n    return a + b\n"
+    )
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_fingerprint_past_its_deadline_is_none_and_keeps_its_progress(ysk, repo):
+    assert ysk.evidence.tree_fingerprint(str(repo), deadline=time.monotonic() - 1) is None
+    assert ysk.evidence.tree_fingerprint(str(repo)) is not None
+
+
+# --- 0.8.0: a green run is credited with the tree it ran on ---------------------------------
+
+
+def _pre(ysk, command, call_id, session="s1"):
+    return ysk._on_pre_tool_call(
+        tool_name="terminal", args={"command": command}, session_id=session, tool_call_id=call_id
+    )
+
+
+def test_a_test_run_that_changes_the_tree_is_credited_with_the_earlier_tree(ysk, repo):
+    _terminal(ysk, f"cd {repo} && git status", "")
+    command = f"cd {repo} && python -m pytest -q"
+    assert _pre(ysk, command, "c1") is None  # never a directive: the call is not blocked
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "src" / "evil.py").write_text("def add(a, b):\n    return 0\n")  # the run wrote it
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": command},
+        result=json.dumps({"output": "1 passed in 0.01s", "exit_code": 0}),
+        status="ok",
+        session_id="s1",
+        tool_call_id="c1",
+    )
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["tree"] == before["hash"] and run["tree_changed_during_run"] is True
+    out = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert out and "the test command itself changed the tree" in out["message"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "cp /tmp/x src/calc.py",
+        "git checkout -- src/calc.py",
+        "sed -i '' s/a/b/ src/calc.py",
+        "(sleep 1; true) &",
+        "cat /tmp/good.py > src/calc.py",
+        "echo x > src/calc.py",
+        "source ./swap.sh",
+        ". ./swap.sh",
+        "env cp /tmp/x src/calc.py",
+        "sort -o src/calc.py /tmp/x",
+        "echo $(cp /tmp/x src/calc.py)",
+        "git show HEAD:src/calc.py > src/calc.py",
+        "git diff --output=src/calc.py",
+        "git -c core.fsmonitor=/tmp/swap status",
+        "export PYTHONPATH=/tmp/plug",
+        "ruff check --fix .",
+        "black .",
+    ],
+)
+def test_a_command_that_can_write_the_tree_around_the_tests_earns_no_tree(ysk, repo, extra):
+    _terminal(ysk, f"cd {repo} && {extra} && python -m pytest -q", "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["passed"] is True and "tree" not in run and run["tree_unavailable"] is True
+    out = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert out and "not credited" in out["message"]
+
+
+def test_read_only_neighbours_still_earn_a_tree(ysk, repo):
+    _terminal(ysk, f"cd {repo} && git status && export X=1 && python -m pytest -q | tail -5", "")
+    _terminal(
+        ysk,
+        f"cd {repo} && source .venv/bin/activate && ruff check . && python -m pytest -q 2>&1",
+        "1 passed in 0.01s",
+    )
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["passed"] is True and run.get("tree")
+
+
+def test_without_a_pre_run_reading_the_tree_after_the_run_stands(ysk, repo):
+    command = f"cd {repo} && python -m pytest -q"
+    _terminal(ysk, command, "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["tree"] == ysk.evidence.tree_fingerprint(str(repo))["hash"]
+    assert "tree_changed_during_run" not in run
+
+
+def test_a_slow_pre_run_fingerprint_gives_up_without_blocking(ysk, repo, monkeypatch):
+    monkeypatch.setattr(ysk, "_PRE_RUN_BUDGET_S", 0.2)
+    monkeypatch.setattr(ysk.evidence, "fingerprint", lambda *a, **k: time.sleep(3))
+    started = time.monotonic()
+    assert _pre(ysk, f"cd {repo} && python -m pytest -q", "c2") is None
+    assert time.monotonic() - started < 2.0
+
+
+def test_a_non_test_command_is_not_fingerprinted_before_it_runs(ysk, repo, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ysk.evidence, "fingerprint", lambda *a, **k: calls.append(a))
+    _pre(ysk, f"cd {repo} && ls", "c3")
+    assert calls == []
+
+
+# --- 0.8.0: diff scans compare with the session's start and say when they cannot run ---------
+
+
+def test_a_weakened_test_committed_after_the_session_started_is_still_found(ysk, repo):
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    _git(repo, "commit", "-qam", "simplify")
+    assert not any(
+        f["category"] == "test_weakened" for f in ysk.tripwires.scan_git_diff(None, str(repo))
+    )
+    findings = ysk.tripwires.scan_git_diff(None, str(repo), base)
+    assert any(f["category"] == "test_weakened" for f in findings)
+
+
+def test_pre_verify_scans_against_the_commit_the_session_started_from(ysk, repo):
+    _terminal(ysk, f"cd {repo} && git status", "")
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    _git(repo, "commit", "-qam", "simplify")
+    ysk._on_pre_verify(session_id="s1", final_response="Done.")
+    scans = [c for c in _checks(ysk) if c.get("kind") == "diff_scan"]
+    assert scans and any(f["category"] == "test_weakened" for f in scans[-1]["findings"])
+
+
+def test_a_diff_scan_git_cannot_run_is_reported(ysk, repo, monkeypatch):
+    monkeypatch.setattr(ysk.tripwires, "_git_output_checked", lambda *a, **k: None)
+    findings = ysk.tripwires.scan_git_diff(None, str(repo))
+    assert [f["category"] for f in findings] == ["guard_degraded"]
+    assert [f["category"] for f in ysk.tripwires.scan_monitoring_diff(str(repo))] == [
+        "guard_degraded"
+    ]
+
+
+def test_a_weakened_test_past_the_twentieth_changed_file_is_found(ysk, repo):
+    for i in range(25):
+        body = f"def test_{i}():\n    assert {i} == {i}\n"
+        (repo / "tests" / f"test_m{i:02d}.py").write_text(body)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "many tests")
+    for i in range(24):
+        (repo / "tests" / f"test_m{i:02d}.py").write_text(
+            f"def test_{i}():\n    assert {i} == {i}\n\n\ndef test_{i}_more():\n    assert True\n"
+        )
+    (repo / "tests" / "test_m24.py").write_text("def test_24():\n    pass\n")
+    findings = ysk.tripwires.scan_git_diff(None, str(repo))
+    assert any(f["category"] == "test_weakened" for f in findings)
+
+
+# --- 0.8.0 review: attacks on the new design --------------------------------------------------
+
+
+def test_an_index_gitlink_over_a_directory_does_not_hide_files_in_it(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "update-index", "--add", "--replace", "--cacheinfo", f"160000,{head},tests")
+    (repo / "tests" / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 3\n")
+    assert "conftest" not in _git(repo, "status", "--porcelain", "--untracked-files=all")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "tests/conftest.py" in after["paths"]
+
+
+def test_an_untracked_nested_repository_with_code_changes_the_fingerprint(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    helpers = repo / "helpers"
+    helpers.mkdir()
+    subprocess.run(["git", "init", "-q", str(helpers)], check=True, capture_output=True)
+    (helpers / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 3\n")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after and after["hash"] != before["hash"]
+    _git(helpers, "add", "-A")
+    _git(helpers, "commit", "-qm", "helpers")
+    committed = ysk.evidence.tree_fingerprint(str(repo))
+    (helpers / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 4\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != committed["hash"]
+
+
+def test_the_global_excludes_file_does_not_hide_a_file(ysk, repo, tmp_path, monkeypatch):
+    config = tmp_path / "xdg"
+    (config / "git").mkdir(parents=True)
+    (config / "git" / "ignore").write_text("tests/conftest.py\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "tests" / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 3\n")
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "tests/conftest.py" in after["paths"]
+
+
+def test_a_submodule_whose_git_was_removed_is_hashed_as_files(ysk, repo, tmp_path):
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "lib.py").write_text("X = 1\n")
+    subprocess.run(["git", "init", "-q", str(lib)], check=True, capture_output=True)
+    _git(lib, "add", "-A")
+    _git(lib, "commit", "-q", "-m", "lib")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "vendor/lib")
+    _git(repo, "commit", "-q", "-m", "submodule")
+    (repo / "vendor" / "lib" / ".git").unlink()
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "vendor" / "lib" / "lib.py").write_text("X = 2\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_self_ignoring_tmp_directory_with_a_conftest_counts(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "tmp").mkdir()
+    (repo / "tmp" / ".gitignore").write_text("*\n")
+    (repo / "tmp" / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 3\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+@pytest.mark.parametrize("kind", ["fifo", "deep", "bad-oid"])
+def test_a_planted_stat_cache_is_ignored_not_trusted(ysk, repo, tmp_path, kind):
+    git_dir = _git(repo, "rev-parse", "--absolute-git-dir").strip()
+    cache = Path(ysk.evidence._stat_cache_path(git_dir))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.unlink(missing_ok=True)
+    if kind == "fifo":
+        os.mkfifo(cache)
+    elif kind == "deep":
+        cache.write_text("[" * 200_000)
+    else:
+        info = (repo / "src" / "calc.py").stat()
+        entry = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, "100644", "sha1"]
+        cache.write_text(
+            json.dumps({"v": 2, "entries": {"src/calc.py": entry + ["0" * 39 + "\t"]}})
+        )
+    started = time.monotonic()
+    fingerprint = ysk.evidence.tree_fingerprint(str(repo))
+    assert fingerprint is not None and time.monotonic() - started < 10
+    assert fingerprint["count"] == 0
+
+
+def test_a_pre_run_reading_that_failed_leaves_the_run_uncredited(ysk, repo, monkeypatch):
+    _terminal(ysk, f"cd {repo} && git status", "")
+    command = f"cd {repo} && python -m pytest -q"
+    real = ysk.evidence.fingerprint
+    monkeypatch.setattr(ysk.evidence, "fingerprint", lambda *a, **k: None)
+    _pre(ysk, command, "c9")
+    monkeypatch.setattr(ysk.evidence, "fingerprint", real)
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": command},
+        result=json.dumps({"output": "1 passed in 0.01s", "exit_code": 0}),
+        status="ok",
+        session_id="s1",
+        tool_call_id="c9",
+    )
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["tree_unavailable"] is True and "tree" not in run
+
+
+def test_a_first_command_that_commits_does_not_become_the_scan_base(ysk, repo):
+    command = (
+        f"cd {repo} && sed -i.bak 's/assert add(1, 2) == 3/pass/' tests/test_calc.py && "
+        "git commit -qam x"
+    )
+    _pre(ysk, command, "c10")
+    (repo / "tests" / "test_calc.py").write_text(
+        "from calc import add\n\n\ndef test_add():\n    pass\n"
+    )
+    _git(repo, "commit", "-qam", "simplify")
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": command},
+        result=json.dumps({"output": "", "exit_code": 0}),
+        status="ok",
+        session_id="s1",
+        tool_call_id="c10",
+    )
+    ysk._on_pre_verify(session_id="s1", final_response="Done.")
+    scans = [c for c in _checks(ysk) if c.get("kind") == "diff_scan"]
+    assert scans and any(f["category"] == "test_weakened" for f in scans[-1]["findings"])
+
+
+def test_a_session_base_that_no_longer_exists_is_reported(ysk, repo):
+    _terminal(ysk, f"cd {repo} && git status", "")
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a + b + 0\n")
+    _git(repo, "commit", "-q", "--amend", "-am", "rewritten")
+    _git(repo, "reflog", "expire", "--expire=now", "--all")
+    _git(repo, "gc", "-q", "--prune=now")
+    ysk._on_pre_verify(session_id="s1", final_response="Done.")
+    scans = [c for c in _checks(ysk) if c.get("kind") == "diff_scan"]
+    assert scans and any(
+        f["category"] == "guard_degraded" and "started from is gone" in f["claim"]
+        for f in scans[-1]["findings"]
+    )
+
+
+def test_a_git_on_path_the_agent_can_rewrite_is_not_used(ysk, tmp_path, monkeypatch):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "git").write_text("#!/bin/sh\necho forged\n")
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    ysk.evidence._git_binary_cache.clear()
+    chosen = ysk.evidence.git_binary()
+    if chosen == str(fake / "git"):
+        pytest.skip("no root-owned git on this host")
+    assert chosen and ysk.evidence._owned_by_someone_else(chosen)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "PYTHONPATH=/tmp/plug python -m pytest -q",
+        "PYTEST_ADDOPTS='-p swapper' python -m pytest -q",
+        "python -m pytest -q -p swapper",
+        "python -m pytest -q --rootdir /tmp/x",
+        "python -m pytest -q > src/out.txt",
+    ],
+)
+def test_a_test_invocation_steered_from_outside_earns_no_tree(ysk, repo, command):
+    _terminal(ysk, f"cd {repo} && {command}", "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["passed"] is True and "tree" not in run
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m pytest -q 2>&1",
+        "python -m pytest -q -p no:cacheprovider",
+        "mypy src && python -m pytest -q",
+        "git status && git log -1 && python -m pytest -q",
+        "python -m pytest -q > /tmp/ysk-out.log 2>&1",
+    ],
+)
+def test_common_test_command_shapes_earn_a_tree(ysk, repo, command):
+    _terminal(ysk, f"cd {repo} && {command}", "1 passed in 0.01s")
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert run["passed"] is True and run.get("tree"), run.get("tree_unavailable_reason")
+
+
+def test_code_that_does_more_than_run_the_tests_earns_no_tree(ysk, repo):
+    code = "import subprocess, os; os.system('git checkout -- src')\nsubprocess.run(['pytest'])"
+    reason = ysk.tripwires._uncredited_reason(code, [{"segment": code}], True)
+    assert reason
+    plain = "import subprocess\nr = subprocess.run(['python', '-m', 'pytest', '-q'])"
+    assert ysk.tripwires._uncredited_reason(plain, [{"segment": plain}], True) is None
+
+
+def test_a_run_that_only_writes_its_own_report_keeps_its_tree(ysk, repo):
+    _terminal(ysk, f"cd {repo} && git status", "")
+    command = f"cd {repo} && python -m pytest -q --junitxml=report.xml"
+    _pre(ysk, command, "r1")
+    (repo / "report.xml").write_text("<testsuite tests='1'/>")
+    (repo / ".hypothesis").mkdir()
+    (repo / ".hypothesis" / "examples").write_text("x")
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": command},
+        result=json.dumps({"output": "1 passed in 0.01s", "exit_code": 0}),
+        status="ok",
+        session_id="s1",
+        tool_call_id="r1",
+    )
+    run = [e for e in ysk._events("s1") if e.get("category") == "test_run"][-1]
+    assert "tree_changed_during_run" not in run and run.get("tree_artifacts")
+    assert ysk._on_pre_verify(session_id="s1", final_response="All tests pass.") is None
+
+
+def test_parallel_test_calls_on_one_repository_share_one_reading(ysk, repo):
+    import threading as _threading
+
+    _terminal(ysk, f"cd {repo} && git status", "")
+    command = f"cd {repo} && python -m pytest -q"
+    threads = [_threading.Thread(target=_pre, args=(ysk, command, f"p{i}")) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    readings = [ysk._ledger("s1")["pre_runs"].get(f"id:p{i}") for i in range(2)]
+    assert all(r and r[0] for r in readings) and readings[0][0] == readings[1][0]
+
+
+def test_a_deadline_in_the_middle_keeps_what_was_hashed(ysk, repo, tmp_path, monkeypatch):
+    for i in range(30):
+        (repo / "src" / f"m{i}.py").write_text(f"X = {i}\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "many")
+    time.sleep(2.2)
+    real = ysk.evidence.time.monotonic
+    calls = {"n": 0}
+
+    def ticking():
+        calls["n"] += 1
+        return real() + (1000 if calls["n"] > 15 else 0)
+
+    monkeypatch.setattr(ysk.evidence.time, "monotonic", ticking)
+    assert ysk.evidence.tree_fingerprint(str(repo), deadline=real() + 100) is None
+    monkeypatch.setattr(ysk.evidence.time, "monotonic", real)
+    (cache,) = (tmp_path / "ysk-stat-cache").glob("*.json")
+    assert json.loads(cache.read_text())["entries"]
+
+
+def test_a_nested_repositorys_own_gitignore_hides_nothing(ysk, repo):
+    helpers = repo / "helpers"
+    helpers.mkdir()
+    subprocess.run(["git", "init", "-q", str(helpers)], check=True, capture_output=True)
+    (helpers / ".gitignore").write_text("conftest.py\n")
+    _git(helpers, "add", "-A")
+    _git(helpers, "commit", "-qm", "ignore")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (helpers / "conftest.py").write_text("import calc\ncalc.add = lambda a, b: 3\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_deeply_nested_repository_still_has_a_fingerprint(ysk, repo):
+    here = repo
+    for name in ("a", "b", "c", "d"):
+        here = here / name
+        here.mkdir()
+        subprocess.run(["git", "init", "-q", str(here)], check=True, capture_output=True)
+        (here / "m.py").write_text("X = 1\n")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    assert before is not None
+    (here / "m.py").write_text("X = 2\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_code_symlink_to_a_prose_file_makes_it_code(ysk, repo):
+    (repo / "notes.md").write_text("X = 1\n")
+    (repo / "src" / "linked.py").symlink_to("../notes.md")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "link")
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "notes.md").write_text("X = 2\n")
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_snapshot_never_reads_the_tree_again(ysk, repo, monkeypatch):
+    monkeypatch.setattr(
+        ysk.evidence, "tree_fingerprint", lambda *a, **k: pytest.fail("second read")
+    )
+    assert ysk.evidence.snapshot(str(repo), None) is None
+
+
+def test_a_replaced_allowlist_blob_is_not_read(ysk, repo):
+    (repo / ".ysk-watch.yaml").write_text("allow: []\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "allowlist")
+    blob = _git(repo, "rev-parse", "HEAD:.ysk-watch.yaml").strip()
+    forged = subprocess.run(
+        ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+        input="allow: [everything]\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "replace", blob, forged)
+    _, text = ysk.ysk_config._committed_allowlist(str(repo))
+    assert "everything" not in text
+
+
+def test_a_first_command_reaching_a_repository_through_git_dash_c_records_its_base(ysk, repo):
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    _pre(ysk, f"git -C {repo} commit -qam x", "g1")
+    assert ysk._ledger("s1")["pre_base"].get(str(repo.resolve())) == head or head in (
+        ysk._ledger("s1")["pre_base"].values()
+    )
+
+
+def test_a_pyc_outside_pycache_is_code(ysk, repo):
+    before = ysk.evidence.tree_fingerprint(str(repo))
+    (repo / "src" / "json.pyc").write_bytes(b"\x00" * 16)
+    after = ysk.evidence.tree_fingerprint(str(repo))
+    assert after["hash"] != before["hash"] and "src/json.pyc" in after["paths"]
+    (repo / "src" / "__pycache__").mkdir()
+    (repo / "src" / "__pycache__" / "calc.cpython-311.pyc").write_bytes(b"\x00" * 16)
+    assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == after["hash"]

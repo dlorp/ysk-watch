@@ -138,32 +138,59 @@ never clear them.
 
 "Tests pass" is checked against git, not against the tool calls the hooks happened to see:
 
-- **Tree fingerprint.** When a test run passes, the working tree it ran on is named by its
-  content: every tracked and untracked (non-ignored) file is staged into a throwaway index and
-  the resulting git tree id is the name. The repository's own index and object store are only
-  read. When the turn asks to finish, the tree is named again. Same name, the evidence is
-  current whatever happened in between, including `git add` and `git commit`; different name,
+- **Tree fingerprint.** A passing test run is credited with the working tree it ran on, named
+  by its content. Every path in HEAD, in the index and untracked (not ignored) is read from
+  disk and hashed raw, the entries go into a throwaway index, and that index's git tree id is
+  the name. When the turn asks to finish, the tree is named again. Same name, the evidence is
+  current whatever happened in between, including `git add` and `git commit`. Different name,
   it is stale, even when every edit went through `sed -i`, a script, or a subagent no edit hook
-  saw. Prose files (`.md`, `.rst`, `.adoc`) are left out of both.
+  saw. Prose files (`.md`, `.rst`, `.adoc`) keep their HEAD version on both sides.
+- **The tree the tests saw.** The tree is read just before a test command runs as well as
+  after. When the command changes the tree (`pytest && cp evil.py src/`), the run is credited
+  with the earlier tree, and a claim about the later code needs a run that saw it. Reports the
+  run writes about itself (a `--junitxml` file, coverage output, `.hypothesis/`) do not count
+  as a change. A command that can write the tree or steer the run around its test step gets no
+  tree at all: copies, checkouts, `sed -i`, file redirections, scripts (`source`, `env cmd`),
+  command substitution, `git -c`, settings such as `PYTHONPATH` or `PYTEST_ADDOPTS`, runner
+  options that load code from elsewhere (`-p plugin`, `--rootdir`), and background jobs. `cd`,
+  plain `export`s, a virtualenv's `activate`, read-only `git`, linters without a fix flag and
+  output filters (`2>&1 | tail`) may sit beside the tests. If the earlier read fails, the run
+  gets no tree either.
 - **The repository does not get a say.** The watched agent can write the repository's config
   and index, so the fingerprint and the diff scans do not take their word:
-  - Settings that make git report less (`core.fsmonitor`, the untracked cache, `core.ignoreStat`,
-    `core.checkStat`, `core.trustctime`, `core.fileMode`) are overridden with git's defaults,
-    from the command line, which outranks every config file.
-  - Nothing the repository names is run: no filter driver (files are hashed raw), no hook
-    (file or config-defined), no external diff or textconv program, no transport or
-    promisor-remote fetch, no `git replace` substitution, and no git process inside a
-    submodule (submodules are compared by commit).
-  - Files marked assume-unchanged or skip-worktree are hashed from disk. A skip-worktree file
-    that is absent is treated as a sparse checkout.
-  - Only `.gitignore` files and your global excludes file hide an untracked file.
-    `.git/info/exclude` and a repository-level `core.excludesFile` do not: they are private,
-    unreviewed state. Put generated files in `.gitignore`.
+  - Nothing is taken from the index but names. Content comes from disk, and unchanged files
+    are recognized by the watcher's own stat cache (size, mtime, ctime, inode, mode), not by
+    the index's. An index rewritten to call an edited file clean, or to call a directory a
+    submodule, hides nothing.
+  - Nothing the repository names is run, and no conversion is applied: no filter driver, eol,
+    `ident` or `working-tree-encoding` conversion, hook (file or config-defined), external diff
+    or textconv program, fsmonitor, transport or promisor-remote fetch, or `git replace`
+    substitution. A file checked out with converted line endings reads as changed from its
+    HEAD blob, the same way every time.
+  - Settings that make git report less (`core.untrackedCache`, `core.ignoreStat`,
+    `core.checkStat`, `core.trustctime`, `core.fileMode`) are overridden from the command line,
+    which outranks every config file.
+  - Only `.gitignore` files hide an untracked file. `.git/info/exclude`, a repository-level
+    `core.excludesFile` and your global excludes file do not: the agent can write all three
+    without changing a tracked file. A `.gitignore` that ignores itself counts as content.
+    `.DS_Store`, `Thumbs.db`, `*.swp`, `*~`, `.idea/`, `.vscode/`, `.direnv/` and
+    `.claude/settings.local.json` are always left out.
+  - Submodules and repositories created inside the checkout are hashed file by file and folded
+    in, so an uncommitted edit inside one counts. Their own `.gitignore` and index are theirs
+    to write and hide nothing. Tool worktrees (`.claude/worktrees/`, `.worktrees/`) are left
+    out.
+  - A file missing from disk counts as deleted, whatever the index marks say. A sparse checkout
+    reads as deleted files, the same way every time.
+  - A code file that is a symlink to a prose file makes that file code.
   - A repository whose config points git at another working tree, or that git refuses to read,
     gets no fingerprint rather than a weaker one.
-- **Unreadable is not unchanged.** When a tree cannot be read (git fails or times out), the
-  claim is held with "evidence unavailable", never passed. That covers a green run whose tree
-  could not be read and a repository that could be read at first sight but not now.
+  - Git itself is run from a root-owned path when the `git` on `PATH` is a file your user can
+    rewrite, such as a wrapper script.
+- **Unreadable is not unchanged.** When a tree cannot be read (git fails, or the check runs out
+  of its 20 s budget), the claim is held with "evidence unavailable", never passed. That covers
+  a green run whose tree could not be read, and a repository that could be read at first
+  sight but not now. Hermes abandons a hook that runs past 30 s and lets the answer through,
+  so the watcher stops itself first.
 - **Per repository.** Every repository the session works in is tracked. Each one a green run
   covered must still have the tree that run saw; each one no green run covered must still have
   the tree it had when the session first went there. Tests run in a clean clone do not cover
@@ -192,8 +219,18 @@ finding can be checked against its own evidence even when the match sits late in
 The push guard resolves the target where the push happens: it walks the compound command,
 follows `cd`, expands `VAR=value` assignments, parses with `shlex`, ignores quoted text (an
 `echo "git push origin main"` is not a push), and treats a payload handed to `bash -c` as a real
-command. A repo whose remote resolves to a local filesystem path is exempt, because publishing to
-a bare mirror on the LAN is not a public push.
+command. A push with no remote named goes where git would send it: `branch.<name>.pushRemote`,
+then `remote.pushDefault`, then `branch.<name>.remote`, then `origin`. With no refspec, the
+destination comes from the remote's `push` refspecs and `mirror` setting, then `push.default`.
+`--all`, `--mirror`, `:` and glob refspecs write main. A push given config of its own
+(`git -c ...`, `GIT_CONFIG_*`, `GIT_DIR`) is taken to reach a forge. A repo whose remote
+resolves to a local filesystem path is exempt, because publishing to a bare mirror on the LAN is
+not a public push. A path is resolved through `url.<base>.insteadOf` first.
+
+The diff scans (test weakening, monitoring removed) compare the tree with the commit the session
+started from, read before its first command ran. A weakened test that was committed during the
+session is still in that diff. Every changed path is read. When git fails, the commit is gone, or
+more than 400 paths changed, the scan says so as a high finding instead of finding nothing.
 
 Session patterns are counted per session and reported once when they cross a threshold:
 
@@ -209,6 +246,7 @@ Session patterns are counted per session and reported once when they cross a thr
 
 | Hook | What it does | Cost |
 |---|---|---|
+| `pre_tool_call` | Before a test command, reads the tree it is about to run on, within 8 s, and never blocks the call (Hermes blocks a tool whose `pre_tool_call` hook runs past 30 s). Also records each repository's HEAD before the session's first command there. | Free, no model call |
 | `post_tool_call` | Runs the tripwires for the call and appends findings to a bounded per-profile, per-session ledger. | Free, no model call |
 | `pre_verify` | Runs when an edited turn is about to finish. If the check itself fails, the turn is held once with a request to say what verifies the work, and the failure is logged as `guard_degraded`. Flags a "tests pass" claim with no passing run behind it, and runs **one** audit by the auxiliary model only if a high-severity tripwire fired. A confirmed finding returns `continue`. A claim closes only when the state stops supporting it (a green run on the current tree). A factual tripwire closes when the answer cites its finding id. Any other finding closes on its id, a path from its evidence, or a specific explanation the model accepts with enough confidence. A rule name alone, or "this is intended", clears nothing. After 3 nudges a finding stops holding the turn and is recorded as `justify_unresolved`. An answer that says the work cannot be finished honestly, and does not also claim a pass, releases the turn and is recorded as `self_reported_incomplete`. In report-only mode nothing is held; what would have been held is logged as `would_block`. | At most `thresholds.max_aux_calls` (default 4) auxiliary calls per session |
 | `transform_llm_output` | Runs on the answer about to be delivered, after Hermes's stop gates. Appends the high findings still unresolved (never surfaced, still open when nudging ended, or claims the answer makes without evidence), each once per session. Skipped in report-only mode, after an honest "could not finish" answer, and with `final_notice: false`. | Free, no model call |
@@ -438,14 +476,25 @@ against reviewed outcomes once there are enough of them.
   other command a later `cd` may not have run, so it is not followed. A terminal whose
   directory was never set by a `cd` has no git evidence, and the edit timeline applies.
 - Files ignored by `.gitignore` are not part of the fingerprint.
-- The fingerprint still takes object ids from the repository's index for paths git does not
-  report as changed, so an agent that rewrites `.git/index` by hand can hide an edit. Content
-  conversions named in attributes (`ident`, `eol`, `working-tree-encoding`) also apply when
-  a file is hashed. A nested repository or submodule counts by its commit id only, and an
-  untracked `.gitignore` can hide files next to it. The tree a run is credited with is read
-  after the test command, not before.
-- The diff scans compare against the current `HEAD`, take at most 20 paths, and find nothing
-  when git fails; the push guard resolves a push with no remote named against `origin`.
+- The fingerprint's stat cache is a file under `$HERMES_HOME/cache/ysk-watch/stat/`, with the
+  watcher's other files. An agent that writes it directly, with the stat data of an edited
+  file and the old object id, can hide the edit. This is the same trust as `config.yaml` above:
+  run unattended agents where they cannot write `$HERMES_HOME`. A cache file that is not a
+  plain, valid one is ignored and the files are hashed again.
+- The first fingerprint of a large repository hashes every file: about 14 s for 2.7 GB. A test
+  run whose earlier tree cannot be read within 8 s gets no tree. Progress is kept, so later runs
+  are fast.
+- Code that the tests load from a file the fingerprint leaves out is not covered: prose files
+  read as code by other code, anything a `.gitignore` ignores, caches (a `__pycache__` holding
+  a hash-based `.pyc` that Python never checks against its source), and files outside the
+  repository (an installed package, a virtualenv's `.pth`).
+- Anything the session started in the background before a test command can still change the
+  tree during the run.
+- Installed packages are outside the fingerprint: an edit inside `.venv/` or `node_modules/`
+  (a pytest plugin that loads itself, a `.pth` file) changes what the tests run against without
+  changing the tree.
+- Hermes skips plugin hooks entirely in its safe-worker mode, `pre_tool_call` included; there
+  the watcher does not run.
 - Outside git the fingerprint is size and modification time, not content: a `touch` reads as an
   edit, and an edit that restores both exactly does not. File types outside the source list
   (images, data files) are not part of it.
