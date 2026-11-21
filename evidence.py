@@ -21,6 +21,8 @@ files the index has been told to stop looking at are looked at anyway.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -29,6 +31,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -192,6 +195,70 @@ def git_binary() -> Optional[str]:
     return _git_binary_cache[found]
 
 
+# git prints paths as the bytes it read from the filesystem. They are decoded as Python's os
+# functions encode a path (the filesystem encoding, with surrogateescape), never by the locale:
+# under a Latin-1 locale on a UTF-8 filesystem every non-ASCII name read back as a file that
+# did not exist, and a strict decode turned any undecodable name into a failed git call. A
+# path read from git now names the same file when it goes back to ``lstat`` or to git.
+# Output is taken as bytes and decoded by ``decode_output``.
+GIT_TEXT: Dict[str, str] = {
+    "encoding": sys.getfilesystemencoding(),
+    "errors": sys.getfilesystemencodeerrors(),
+}
+
+
+# One deadline for everything a hook does on its own thread. Hermes abandons a hook that runs
+# past 30 s and lets the answer through, and the diff scans make several git calls of 5 s
+# each: against a repository whose config blocks git that came to 90 s. Every git call made
+# under ``hook_deadline`` gets only what is left, and none starts once it is spent.
+_hook = threading.local()
+
+
+@contextlib.contextmanager
+def hook_deadline(seconds: float) -> Any:
+    """Bound every git call on this thread to ``seconds`` from now (nested: the earlier wins)."""
+    previous = getattr(_hook, "deadline", None)
+    mine = time.monotonic() + seconds
+    _hook.deadline = mine if previous is None else min(previous, mine)
+    try:
+        yield
+    finally:
+        _hook.deadline = previous
+
+
+def hook_timeout(timeout: float) -> Optional[float]:
+    """``timeout`` cut to the hook's remaining time; ``None`` when nothing is left."""
+    deadline = getattr(_hook, "deadline", None)
+    if deadline is None:
+        return timeout
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return None
+    return min(timeout, left)
+
+
+def decode_output(data: Optional[bytes]) -> str:
+    """git's output as text, decoded by ``GIT_TEXT``.
+
+    Bytes in, decoded here: text mode would also translate newlines, and a file named
+    ``helper\\r.py`` would read back as ``helper\\n.py``, a file that does not exist.
+    """
+    return (data or b"").decode(**GIT_TEXT)
+
+
+def printable(text: str) -> str:
+    """``text`` with any byte the filesystem encoding could not decode written as ``\\udcXX``.
+
+    A path decoded with surrogateescape cannot be encoded to UTF-8 as it is, so it could not go
+    into a ledger line, a JSON payload or a chat message. Everything else passes unchanged.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return text
+
+
 def _run_git(
     directory: Optional[str],
     args: List[str],
@@ -200,21 +267,35 @@ def _run_git(
     timeout: float = _GIT_TIMEOUT_S,
     input: Optional[str] = None,
     extra_config: Tuple[Tuple[str, str], ...] = (),
+    stderr_fails: Tuple[str, ...] = (),
 ) -> Tuple[bool, str]:
+    """Run git; ``(succeeded, stdout)``. ``stderr_fails`` names warnings that make the call a
+    failure although git exits 0 (a directory it could not read, for one)."""
     here = directory or os.getcwd()
+    limit = hook_timeout(timeout)
+    if limit is None:
+        return False, ""  # the hook's time is spent: a failed call, not a clean answer
+    timeout = limit
     run_env = hardened_env(env, extra_config)
+    if stderr_fails:
+        # The markers are git's English messages; gettext would translate them. Paths are
+        # bytes to git whatever the locale, so this changes only the message text.
+        run_env = dict(run_env, LC_ALL="C", LANGUAGE="")
     try:
         proc = subprocess.run(
             [git_binary() or "git", "-C", here, *args],
             capture_output=True,
-            text=True,
             timeout=timeout,
             env=run_env,
-            input=input,
+            input=None if input is None else input.encode(**GIT_TEXT),
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return False, ""
-    return proc.returncode == 0, proc.stdout or ""
+    if stderr_fails:
+        err = decode_output(proc.stderr)
+        if any(marker in err for marker in stderr_fails):
+            return False, ""
+    return proc.returncode == 0, decode_output(proc.stdout)
 
 
 def git(directory: Optional[str], args: List[str]) -> str:
@@ -382,6 +463,10 @@ _JUNK_EXCLUDES = (
     "--exclude=/.claude/settings.local.json",
 )
 # Tool worktrees: repositories of their own that the session's tools create inside a checkout.
+# git lists what it can read and only warns about a directory it cannot open, exit status 0.
+# A file in such a directory can still be run by exact path, so the listing is a failure.
+_UNREADABLE_DIR_WARNINGS = ("could not open directory",)
+
 _TOOL_WORKTREE_RE = re.compile(r"^(?:\.claude/worktrees|\.worktrees)/")
 
 
@@ -403,7 +488,14 @@ def _untracked_paths(
     ``None`` when the listing fails: a partial list would name a tree that does not exist.
     """
     args = ["ls-files", "-z", "--others", "--exclude-per-directory=.gitignore", *_JUNK_EXCLUDES]
-    ok, raw = _run_git(root, args, env=env, timeout=timeout, extra_config=extra_config)
+    ok, raw = _run_git(
+        root,
+        args,
+        env=env,
+        timeout=timeout,
+        extra_config=extra_config,
+        stderr_fails=_UNREADABLE_DIR_WARNINGS,
+    )
     if not ok:
         return None
     files: List[str] = []
@@ -441,7 +533,14 @@ def _ignored_gitignores(
         ":(glob)**/.gitignore",
         *_CACHE_PATHSPECS,
     ]
-    ok, raw = _run_git(root, args, env=env, timeout=timeout, extra_config=extra_config)
+    ok, raw = _run_git(
+        root,
+        args,
+        env=env,
+        timeout=timeout,
+        extra_config=extra_config,
+        stderr_fails=_UNREADABLE_DIR_WARNINGS,
+    )
     if not ok:
         return None
     return [path for path in raw.split("\0") if path and not _CACHE_PATH_RE.search(path)]
@@ -891,7 +990,7 @@ def _hash_tree(node: Dict[str, Any], algo: str) -> bytes:
     """The binary id of one tree object, its subtrees hashed first."""
     items = []
     for name, value in node.items():
-        raw = name.encode("utf-8", "surrogateescape")
+        raw = os.fsencode(name)  # the bytes git read from the filesystem
         if isinstance(value, dict):
             items.append((raw + b"/", b"40000", raw, _hash_tree(value, algo)))
         else:
@@ -927,27 +1026,62 @@ def _plain_dir_digest(
     cache: Optional[Dict[str, List[Any]]] = None,
     fresh: Optional[Dict[str, List[Any]]] = None,
     prefix: str = "",
+    found_links: Optional[List[str]] = None,
+    budget: Optional[List[int]] = None,
+    prune: Optional["set[str]"] = None,
+    covered: Optional[Any] = None,
+    forbidden: Optional["set[str]"] = None,
 ) -> Optional[str]:
     """Content of a directory as one digest, every file in it; ``""`` when empty.
 
     Used for submodules and repositories inside the checkout: their own ``.gitignore`` and
     index are theirs to write, so nothing in them is consulted. Files are hashed raw (through
     the outer stat cache, keyed ``prefix/relative``); caches and ``.git`` are skipped and
-    symlinked directories are hashed as links, not followed.
+    symlinked directories are hashed as links, not followed. Every symlink met is added to
+    ``found_links`` so the caller can follow the ones that leave the tree. ``budget`` is
+    ``[files, bytes]`` still allowed (bytes count only files hashed now, so a reading cut off
+    by it resumes); past it the digest is ``None``. Directories in ``prune`` are not entered,
+    and files ``covered(full_path)`` vouches for are counted elsewhere and left out. Meeting
+    a directory in ``forbidden`` makes the digest ``None``.
+
+    A directory that cannot be listed makes the digest ``None``: a file in it can still be
+    opened by exact path.
     """
     now_ns = time.time_ns()
     lines: List[str] = []
-    for current, dirs, files in os.walk(path):
+    errors: List[OSError] = []
+    if prune and path in prune:
+        return ""
+    for current, dirs, files in os.walk(path, onerror=errors.append):
+        # Checked per directory as well as per file: a tree of empty directories has no file
+        # to check at.
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        if budget is not None:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return None
         # A symlinked directory is not followed (os.walk would skip it silently): its target
         # text is hashed like a symlinked file's, so retargeting it changes the digest.
         links = [d for d in dirs if os.path.islink(os.path.join(current, d))]
+        if forbidden and (
+            current in forbidden or any(os.path.join(current, d) in forbidden for d in dirs)
+        ):
+            return None
         dirs[:] = sorted(
-            d for d in dirs if d not in _CACHE_NAMES and d != ".git" and d not in links
+            d
+            for d in dirs
+            if d not in _CACHE_NAMES
+            and d != ".git"
+            and d not in links
+            and not (prune and os.path.join(current, d) in prune)
         )
         for name in sorted([*files, *links]):
             if deadline is not None and time.monotonic() > deadline:
                 return None
             full = os.path.join(current, name)
+            if covered is not None and covered(full):
+                continue
             try:
                 info = os.lstat(full)
             except OSError:
@@ -955,10 +1089,16 @@ def _plain_dir_digest(
             relative = os.path.relpath(full, path)
             if stat.S_ISLNK(info.st_mode):
                 mode = "120000"
+                if found_links is not None:
+                    found_links.append(full)
             elif stat.S_ISREG(info.st_mode):
                 mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
             else:
                 continue
+            if budget is not None:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return None
             key = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, mode, algo]
             cached = (cache or {}).get(prefix + relative)
             if cached is not None and cached[:6] == key:
@@ -966,6 +1106,10 @@ def _plain_dir_digest(
             elif mode == "120000":
                 oid = _hash_symlink(full, algo)
             else:
+                if budget is not None:
+                    budget[1] -= info.st_size
+                    if budget[1] < 0:
+                        return None
                 oid = _hash_file(full, info, algo, deadline)
             if oid is None:
                 return None
@@ -973,9 +1117,196 @@ def _plain_dir_digest(
                 if now_ns - info.st_ctime_ns > _RACY_NS:
                     fresh[prefix + relative] = key + [oid]
             lines.append(f"{relative}\0{info.st_mode & 0o170777:o}\0{oid}")
+    if errors:
+        return None
     if not lines:
         return ""
-    return "p" + hashlib.sha256("\n".join(lines).encode("utf-8", "surrogateescape")).hexdigest()
+    return "p" + hashlib.sha256(os.fsencode("\n".join(lines))).hexdigest()
+
+
+# Stat-cache keys for files read through a symlink are absolute paths behind this prefix; a
+# path from git is relative and never starts with "/".
+_OUTSIDE_PREFIX = "//"
+# What may be read through symlinks, all links together: files walked, and bytes hashed now
+# (cached files cost nothing, so a reading cut off by the byte budget resumes). Past either the
+# reading is unknown: a link to a home directory or a dataset cannot be vouched for in a hook.
+_OUTSIDE_MAX_FILES = 20000
+_OUTSIDE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _linked_targets(
+    root: str,
+    git_dir: str,
+    links: List[str],
+    prose_links: "set[str]",
+    from_disk: "set[str]",
+    algo: str,
+    deadline: Optional[float],
+    cache: Dict[str, List[Any]],
+    fresh: Dict[str, List[Any]],
+) -> Optional[List[str]]:
+    """What symlinks point at that the fingerprint does not otherwise read, one record per link.
+
+    The tree holds a link's text, but the tests load what it points at. Behind
+    ``src/impl.py -> /elsewhere/impl.py``, ``-> ../build/impl.py`` (ignored) or
+    ``-> ../.git/impl.py``, an edit to the target changed nothing the tree records. A target
+    is skipped only when it is a file inside the tree that was hashed from disk
+    (``from_disk``). Otherwise each link gives ``link NUL target NUL digest``: the file's blob
+    id, a directory's content digest (files inside the tree hashed from disk, the tree itself
+    when the target holds it, and ``.git`` are left out; links inside are followed the same
+    way), ``absent``, or the file type of a FIFO or device, which is never opened. Each target
+    is read once.
+
+    ``None`` past the deadline, when something cannot be read or listed, or past the file or
+    byte budget: unknown, never partial.
+    """
+    real_root = os.path.realpath(root)
+    root_prefix = os.path.join(root, "")
+    real_prefix = os.path.join(real_root, "")
+    # The tree (and a git directory inside it) is read by the fingerprint itself, and the stat
+    # cache is rewritten by every reading: a link to a directory holding them leaves them out.
+    prune = {real_root, os.path.realpath(_cache_dir())}
+    # A git directory moved out of the tree (a ``.git`` file naming it) is the agent's to fill,
+    # and a walk that meets it there has no right to skip it: no fingerprint instead.
+    real_git = os.path.realpath(git_dir)
+    forbidden = set() if real_git.startswith(real_prefix) else {real_git}
+
+    def counted(full: str) -> bool:
+        return full.startswith(real_prefix) and full[len(real_prefix) :] in from_disk
+
+    budget = [_OUTSIDE_MAX_FILES, _OUTSIDE_MAX_BYTES]
+    done: Dict[str, str] = {}
+    records: List[str] = []
+    queue = list(links)
+    now_ns = time.time_ns()
+    while queue:
+        if deadline is not None and time.monotonic() > deadline:
+            return None
+        link = queue.pop()
+        target = os.path.realpath(link)
+        digest = done.get(target)
+        if digest is None:
+            try:
+                info = os.lstat(target)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                    return None  # a target that cannot be looked at is unknown, not absent
+                digest = "absent"
+            else:
+                if stat.S_ISREG(info.st_mode):
+                    if counted(target) or (link in prose_links and is_doc(target)):
+                        done[target] = ""
+                        continue  # an entry of its own, hashed from disk
+                    budget[0] -= 1
+                    if budget[0] < 0:
+                        return None
+                    mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+                    key = [
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
+                        info.st_ino,
+                        mode,
+                        algo,
+                    ]
+                    cached = cache.get(_OUTSIDE_PREFIX + target)
+                    if cached is not None and cached[:6] == key:
+                        digest = cached[6]
+                    else:
+                        budget[1] -= info.st_size
+                        if budget[1] < 0:
+                            return None
+                        digest = _hash_file(target, info, algo, deadline)
+                        if digest is None:
+                            return None
+                    if (
+                        now_ns - info.st_mtime_ns > _RACY_NS
+                        and now_ns - info.st_ctime_ns > _RACY_NS
+                    ):
+                        fresh[_OUTSIDE_PREFIX + target] = key + [digest]
+                    digest = f"{mode}:{digest}"
+                elif stat.S_ISDIR(info.st_mode):
+                    inner: List[str] = []
+                    sub = _plain_dir_digest(
+                        target,
+                        algo,
+                        deadline,
+                        cache,
+                        fresh,
+                        _OUTSIDE_PREFIX + os.path.join(target, ""),
+                        inner,
+                        budget,
+                        # A link straight at the git directory is followed (its content is
+                        # not otherwise read); one at the tree itself reads nothing new.
+                        prune - {target} if target != real_root else prune,
+                        counted,
+                        forbidden - {target},
+                    )
+                    if sub is None:
+                        return None
+                    queue.extend(inner)
+                    digest = f"dir:{sub}"
+                elif stat.S_ISLNK(info.st_mode):
+                    # realpath stops at a loop: the link it stopped at is named by its text.
+                    try:
+                        digest = "loop:" + os.readlink(target)
+                    except OSError:
+                        return None
+                else:
+                    digest = f"type:{stat.S_IFMT(info.st_mode):o}"
+            done[target] = digest
+        if not digest:
+            continue
+        label = link[len(root_prefix) :] if link.startswith(root_prefix) else link
+        records.append(f"{label}\0{target}\0{digest}")
+    return sorted(records)
+
+
+def _bounded_linked_targets(
+    root: str,
+    git_dir: str,
+    links: List[str],
+    prose_links: "set[str]",
+    from_disk: "set[str]",
+    algo: str,
+    deadline: Optional[float],
+    cache: Dict[str, List[Any]],
+    fresh: Dict[str, List[Any]],
+) -> Optional[List[str]]:
+    """``_linked_targets`` on a daemon thread, given up at the deadline.
+
+    ``realpath`` and ``lstat`` on an attacker-chosen target (an automount such as ``/net``)
+    can block in the kernel, where no deadline check runs; the hook stops waiting instead.
+    The thread only reads ``cache`` and writes a dict of its own, merged into ``fresh`` when
+    it finished in time, so a thread left behind changes nothing.
+    """
+    own: Dict[str, List[Any]] = {}
+    box: Dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["records"] = _linked_targets(
+                root, git_dir, links, prose_links, from_disk, algo, deadline, cache, own
+            )
+        except Exception:
+            box["records"] = None
+
+    if links:
+        thread = threading.Thread(target=run, name="ysk-watch-links", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            run()
+        else:
+            thread.join(_remaining(deadline, _STAGE_TIMEOUT_S))
+            if thread.is_alive():
+                return None
+    else:
+        box["records"] = []
+    records = box.get("records")
+    if records is not None:
+        fresh.update(own)
+    return records
 
 
 def _nested_entry(
@@ -986,6 +1317,7 @@ def _nested_entry(
     cache: Dict[str, List[Any]],
     fresh: Dict[str, List[Any]],
     prefix: str,
+    found_links: Optional[List[str]] = None,
 ) -> Optional[Tuple[str, str]]:
     """``(commit, content digest)`` for a repository inside the working tree.
 
@@ -1009,14 +1341,18 @@ def _nested_entry(
         toplevel = bounded(["rev-parse", "--show-toplevel"]).strip()
         if toplevel and os.path.realpath(toplevel) == os.path.realpath(path):
             head = bounded(["rev-parse", "--verify", "-q", "HEAD"]).strip()
-    digest = _plain_dir_digest(path, algo, deadline, cache, fresh, prefix)
+    digest = _plain_dir_digest(path, algo, deadline, cache, fresh, prefix, found_links)
     if digest is None:
         return None
     return (head or recorded), digest
 
 
 def _hash_linked_docs(
-    root: str, entries: Dict[str, Tuple[str, str]], algo: str, deadline: Optional[float]
+    root: str,
+    entries: Dict[str, Tuple[str, str]],
+    algo: str,
+    deadline: Optional[float],
+    from_disk: "set[str]",
 ) -> bool:
     """A code path that is a symlink to a prose file makes that file code.
 
@@ -1044,6 +1380,7 @@ def _hash_linked_docs(
         if oid is None:
             return False
         entries[target] = ("100755" if info.st_mode & stat.S_IXUSR else "100644", oid)
+        from_disk.add(target)
     return True
 
 
@@ -1081,6 +1418,18 @@ def tree_fingerprint(
     config points git at another working tree, when git fails, or at the deadline. Callers
     decide what an unknown tree means; this function never guesses.
     """
+    try:
+        return _tree_fingerprint(directory, include_docs, deadline)
+    except Exception:
+        # Anything unexpected (a RecursionError from a long symlink chain in Python 3.11's
+        # realpath, a thread that cannot start) is an unread tree, never an exception that
+        # stops the hook and lets the claim through.
+        return None
+
+
+def _tree_fingerprint(
+    directory: Optional[str], include_docs: bool, deadline: Optional[float]
+) -> Optional[Dict[str, Any]]:
     root = repo_root(directory)
     if not root or not _within(directory, root):
         return None
@@ -1237,6 +1586,11 @@ def _fingerprint_in(
         if now_ns - info.st_mtime_ns > _RACY_NS and now_ns - info.st_ctime_ns > _RACY_NS:
             fresh[path] = key + [oid]
 
+    # Every symlink in the tree (and in nested repositories), followed after the walk, and
+    # every path whose content was read from disk rather than kept from HEAD.
+    symlinks: List[str] = []
+    prose_links: "set[str]" = set()
+    from_disk: "set[str]" = set()
     # Regular files the stat cache does not vouch for, hashed together after the walk.
     pending: List[Tuple[str, str, os.stat_result, str, List[Any]]] = []
     for walked, path in enumerate(candidates):
@@ -1255,6 +1609,12 @@ def _fingerprint_in(
         if not include_docs and is_doc(path):
             if path in head_entries:
                 entries[path] = head_entries[path]
+            # A prose-named link (``lib.md -> /elsewhere``) can still lead to code: it is
+            # followed, and a prose file it points at keeps the prose rule.
+            doc_full = os.path.join(root, path)
+            if os.path.islink(doc_full) and os.path.basename(path) not in _CACHE_NAMES:
+                symlinks.append(doc_full)
+                prose_links.add(doc_full)
             continue
         recorded_head = head_entries.get(path)
         full = os.path.join(root, path)
@@ -1266,7 +1626,9 @@ def _fingerprint_in(
             # set, so it cannot excuse a deletion.)
             continue
         if recorded_head and recorded_head[0] == "160000" and stat.S_ISDIR(info.st_mode):
-            sub = _nested_entry(full, recorded_head[1], algo, deadline, cache, fresh, path + "/")
+            sub = _nested_entry(
+                full, recorded_head[1], algo, deadline, cache, fresh, path + "/", symlinks
+            )
             if sub is None:
                 give_up()
                 return None
@@ -1276,6 +1638,10 @@ def _fingerprint_in(
             continue
         if stat.S_ISLNK(info.st_mode):
             mode = "120000"
+            if os.path.basename(path) not in _CACHE_NAMES:
+                # A link named like a cache (``.venv -> ~/.virtualenvs/x``) is a cache, as
+                # the directory of that name would be.
+                symlinks.append(full)
         elif stat.S_ISREG(info.st_mode):
             mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
         else:
@@ -1293,6 +1659,7 @@ def _fingerprint_in(
             pending.append((path, full, info, mode, key))
             continue
         entries[path] = (mode, oid)
+        from_disk.add(path)
         remember(path, info, key, oid)
     if pending:
         oids = _hash_files([(full, info) for _, full, info, _, _ in pending], algo, deadline)
@@ -1302,19 +1669,28 @@ def _fingerprint_in(
                 unread = True  # changed while read, unreadable, or the deadline passed
                 continue
             entries[path] = (mode, hashed)
+            from_disk.add(path)
             remember(path, info, key, hashed)
         if unread:
             give_up()
             return None
     for path in nested_repos:
         # An untracked repository inside the checkout: importable code, not committed here.
-        sub = _nested_entry(os.path.join(root, path), "", algo, deadline, cache, fresh, path + "/")
+        sub = _nested_entry(
+            os.path.join(root, path), "", algo, deadline, cache, fresh, path + "/", symlinks
+        )
         if sub is None:
             give_up()
             return None
         if sub[1]:
             nested.append((path + "/", sub[1]))
-    if not include_docs and not _hash_linked_docs(root, entries, algo, deadline):
+    if not include_docs and not _hash_linked_docs(root, entries, algo, deadline, from_disk):
+        give_up()
+        return None
+    outside = _bounded_linked_targets(
+        root, git_dir, symlinks, prose_links, from_disk, algo, deadline, cache, fresh
+    )
+    if outside is None:
         give_up()
         return None
     if fresh != cache:
@@ -1332,15 +1708,20 @@ def _fingerprint_in(
     }
     changed = sorted(path for path in changes if include_docs or not is_doc(path))
     changed += sorted(path for path, _ in nested if path.endswith("/"))
-    name = tree[:12]
-    if nested or clashes:
+    # The full id: a 48-bit prefix is a birthday search away for an agent that writes both
+    # the code a green run sees and the code it swaps in. ``short`` is for display only.
+    name = tree
+    if nested or clashes or outside:
         folded = tree + "".join(f"\n{path}\0{inner}" for path, inner in sorted(nested))
         # Entries no tree can hold (a file where a directory is). The \x01 marker keeps them
         # apart from the nested digests.
         folded += "".join(f"\n\x01{path}\0{mode}\0{oid}" for path, mode, oid in clashes)
-        name = "s" + hashlib.sha256(folded.encode("utf-8", "surrogateescape")).hexdigest()[:11]
+        # What symlinks leaving the tree point at; \x02 keeps these apart too.
+        folded += "".join(f"\n\x02{record}" for record in outside)
+        name = "s" + hashlib.sha256(os.fsencode(folded)).hexdigest()
     return {
         "hash": name,
+        "short": name[:12],
         "tree": tree,
         "head": head[:7],
         "head_full": head,
@@ -1443,7 +1824,8 @@ def dir_fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
                 return None
     digest = hashlib.sha256("\n".join(sorted(entries)).encode("utf-8", "replace")).hexdigest()
     return {
-        "hash": "d" + digest[:11],
+        "hash": "d" + digest,
+        "short": "d" + digest[:11],
         "tree": digest,
         "head": "",
         "root": root,
@@ -1456,7 +1838,17 @@ def dir_fingerprint(directory: Optional[str]) -> Optional[Dict[str, Any]]:
 def fingerprint(
     directory: Optional[str], *, deadline: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
-    """The git tree fingerprint inside a repository, the directory fingerprint outside one."""
+    """The git tree fingerprint inside a repository, the directory fingerprint outside one.
+
+    Never raises: any failure is ``None``, an unread tree.
+    """
+    try:
+        return _fingerprint(directory, deadline)
+    except Exception:
+        return None
+
+
+def _fingerprint(directory: Optional[str], deadline: Optional[float]) -> Optional[Dict[str, Any]]:
     if not directory:
         return None
     if repo_root(directory):

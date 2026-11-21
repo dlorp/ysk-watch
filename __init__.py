@@ -30,6 +30,7 @@ plugin; ``YSK_WATCH_AUX=0`` keeps tripwires but skips model calls.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -170,7 +171,8 @@ def _persist_events(key_id: str, events: List[Dict[str, Any]]) -> None:
     try:
         path = _ledger_path(key_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        # A path git could not decode carries surrogate escapes; write them as \udcXX.
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as fh:
             for event in events:
                 fh.write(json.dumps(event, ensure_ascii=False) + "\n")
         _trim_ledger_file(path)
@@ -324,7 +326,7 @@ def _log_check(kind: str, payload: Dict[str, Any]) -> None:
             ensure_ascii=False,
             default=str,
         )
-        with path.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as fh:
             fh.write(line + "\n")
     except Exception as exc:  # logging must never be the reason a hook fails
         logger.debug("ysk-watch: could not write checks log: %s", exc)
@@ -344,7 +346,7 @@ def _finding_id(finding: Dict[str, Any], key_id: str) -> str:
     if category in _DETERMINISTIC_CATEGORIES:
         evidence_text = ""
     material = "|".join([category, str(key_id or ""), evidence_text])
-    return "f-" + hashlib.sha1(material.encode("utf-8", "replace")).hexdigest()[:7]
+    return "f-" + hashlib.sha1(material.encode("utf-8", "surrogatepass")).hexdigest()[:7]
 
 
 def _stamp(findings: List[Dict[str, Any]], key_id: str) -> List[Dict[str, Any]]:
@@ -424,9 +426,9 @@ def _note_root(led: Dict[str, Any], directory: Optional[str], *, edited: bool) -
     with _lock:
         base_head = led["pre_base"].pop(root, None)
     if not edited:
-        fingerprint = evidence.tree_fingerprint(
-            root, deadline=time.monotonic() + _NOTE_ROOT_BUDGET_S
-        )
+        # Bounded on a thread like the pre-run reading: a tree that stalls or fails is an
+        # unknown baseline, and the root is registered all the same.
+        fingerprint = _bounded_fingerprint(root, _NOTE_ROOT_BUDGET_S)
         baseline = fingerprint["hash"] if fingerprint else None
         if base_head is None and fingerprint:
             base_head = fingerprint["head_full"]
@@ -552,11 +554,11 @@ def _pre_run_key(tool_call_id: str, args: Any) -> str:
     if tool_call_id:
         return f"id:{tool_call_id}"
     command = tripwires._command_of(args) if isinstance(args, dict) else ""
-    return "cmd:" + hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()[:16]
+    return "cmd:" + hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 def _bounded_fingerprint(
-    directory: str, budget: float, on_done: Any = None
+    directory: str, budget: float, on_done: Any = None, grace: float = 1.0
 ) -> Optional[Dict[str, Any]]:
     """``evidence.fingerprint`` that returns within ``budget`` seconds whatever git does.
 
@@ -576,9 +578,37 @@ def _bounded_fingerprint(
                 on_done(box.get("tree"))
 
     thread = threading.Thread(target=work, name="ysk-watch-pre-run", daemon=True)
-    thread.start()
-    thread.join(budget + 1.0)
+    try:
+        thread.start()
+    except RuntimeError:
+        return None  # no thread to bound it with: unread, rather than unbounded
+    thread.join(budget + grace)
     return box.get("tree")
+
+
+def _check_reading(where: Optional[str], deadline: float) -> Optional[Dict[str, Any]]:
+    """A check-time reading within what is left of the check's deadline, with no grace on
+    top: however many repositories a check reads, it ends with its budget."""
+    left = deadline - time.monotonic()
+    if left <= 0.05:
+        return None
+    return _bounded_fingerprint(where, left, grace=0.0)
+
+
+# Everything a stop hook does on its own thread, git calls included. Hermes abandons a hook at
+# 30 s and lets the answer through.
+_HOOK_BUDGET_S = 25.0
+
+
+def _within_hook_budget(hook: Any) -> Any:
+    """Run ``hook`` under ``evidence.hook_deadline(_HOOK_BUDGET_S)``."""
+
+    @functools.wraps(hook)
+    def bounded(*args: Any, **kwargs: Any) -> Any:
+        with evidence.hook_deadline(_HOOK_BUDGET_S):
+            return hook(*args, **kwargs)
+
+    return bounded
 
 
 def _shared_pre_run_tree(
@@ -586,26 +616,36 @@ def _shared_pre_run_tree(
 ) -> Optional[Dict[str, Any]]:
     """One reading per repository at a time. A second test call while one is in flight
     (two in one turn) waits for it, within the same budget, and shares it: neither command
-    has run yet, so it is the same tree. The flag clears when the reading really ends."""
+    has run yet, so it is the same tree. A reading its owner stopped waiting for is
+    abandoned: the owner's command has run since, so nobody may be credited with it."""
     with _lock:
         inflight = led["pre_inflight"].get(busy_key)
         owner = inflight is None
         if owner:
-            inflight = {"done": threading.Event(), "tree": None}
+            inflight = {"done": threading.Event(), "tree": None, "ok": False}
             led["pre_inflight"][busy_key] = inflight
     if not owner:
         inflight["done"].wait(_PRE_RUN_BUDGET_S + 1.0)
-        return inflight["tree"] if inflight["done"].is_set() else None
+        with _lock:
+            return inflight["tree"] if inflight["ok"] else None
 
     def finished(tree: Optional[Dict[str, Any]]) -> None:
-        inflight["tree"] = tree
-        inflight["done"].set()
         with _lock:
+            if not inflight.get("abandoned"):
+                inflight["tree"] = tree
+                inflight["ok"] = True
             if led["pre_inflight"].get(busy_key) is inflight:
                 del led["pre_inflight"][busy_key]
+        inflight["done"].set()
 
     _bounded_fingerprint(run_dir, _PRE_RUN_BUDGET_S, on_done=finished)
-    return inflight["tree"] if inflight["done"].is_set() else None
+    with _lock:
+        if inflight["ok"]:
+            return inflight["tree"]
+        inflight["abandoned"] = True
+        if led["pre_inflight"].get(busy_key) is inflight:
+            del led["pre_inflight"][busy_key]
+    return None
 
 
 def _on_pre_tool_call(
@@ -728,6 +768,7 @@ def _credit_pre_run_tree(
             event["tree_changed_during_run"] = True
 
 
+@_within_hook_budget
 def _on_post_tool_call(
     tool_name: str = "",
     args: Any = None,
@@ -1043,8 +1084,8 @@ def _stale_test_evidence(
                         else ""
                     )
                     problems.append(
-                        f"{name}: tests passed on tree {run['tree']}, the tree is now "
-                        f"{current['hash']}" + (f" ({paths})" if paths else "") + during
+                        f"{name}: tests passed on tree {str(run['tree'])[:12]}, the tree is now "
+                        f"{current['hash'][:12]}" + (f" ({paths})" if paths else "") + during
                     )
                 continue
             baseline = (roots.get(root) or {}).get("baseline")
@@ -1383,6 +1424,7 @@ def _aux_justify(
 _degraded_sessions: "OrderedDict[str, bool]" = OrderedDict()
 
 
+@_within_hook_budget
 def _on_pre_verify(
     session_id: str = "",
     final_response: str = "",
@@ -1440,7 +1482,7 @@ def _pre_verify(
     def fingerprint(where: Optional[str]) -> Optional[Dict[str, Any]]:
         key = where or ""
         if key not in fingerprints:
-            fingerprints[key] = evidence.fingerprint(where, deadline=deadline)
+            fingerprints[key] = _check_reading(where, deadline)
         return fingerprints[key]
 
     root_here = _repo_root(directory) if directory else None
@@ -1669,7 +1711,7 @@ def _pre_verify(
         "pre_verify_block",
         {"session_id": session_id, "repo": repo, "attempt": attempt, "findings": blocking},
     )
-    return {"action": "continue", "message": _continue_message(blocking)}
+    return {"action": "continue", "message": evidence.printable(_continue_message(blocking))}
 
 
 _CLEAR_HINTS = {
@@ -2092,7 +2134,7 @@ def _bounded_check_fingerprint() -> Any:
     def fingerprint(where: Optional[str]) -> Optional[Dict[str, Any]]:
         key = where or ""
         if key not in seen:
-            seen[key] = evidence.fingerprint(where, deadline=deadline)
+            seen[key] = _check_reading(where, deadline)
         return seen[key]
 
     return fingerprint
@@ -2156,6 +2198,7 @@ def _final_notice(key_id: str, session_id: str, text: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+@_within_hook_budget
 def _on_transform_llm_output(
     response_text: Any = None, session_id: str = "", **_: Any
 ) -> Optional[str]:
@@ -2174,7 +2217,7 @@ def _on_transform_llm_output(
         return None
     if not notice:
         return None
-    return response_text.rstrip() + "\n\n" + notice
+    return response_text.rstrip() + "\n\n" + evidence.printable(notice)
 
 
 def register(ctx) -> None:

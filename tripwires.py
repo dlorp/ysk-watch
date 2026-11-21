@@ -927,6 +927,9 @@ def _resolve_push_urls(directory: str, remote: str) -> List[str]:
     send a push somewhere other than where fetches come from, and a push goes to every
     ``pushurl``. Read-only, no network, bounded; empty on any error.
     """
+    limit = evidence.hook_timeout(_REMOTE_TIMEOUT_S)
+    if limit is None:
+        return []
     try:
         proc = subprocess.run(
             [
@@ -937,14 +940,14 @@ def _resolve_push_urls(directory: str, remote: str) -> List[str]:
             ],
             env=evidence.hardened_env(),
             capture_output=True,
-            text=True,
-            timeout=_REMOTE_TIMEOUT_S,
+            timeout=limit,
         )
     except (OSError, subprocess.SubprocessError):
         return []
     if proc.returncode != 0:
         return []
-    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    out = evidence.decode_output(proc.stdout)
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def _is_filesystem_remote(target: str) -> bool:
@@ -1079,7 +1082,7 @@ def redact(text: str) -> str:
     """
     if not text:
         return text
-    out = _ALREADY_REDACTED_RE.sub("«redacted»", text)
+    out = _ALREADY_REDACTED_RE.sub("«redacted»", evidence.printable(text))
     for pattern, repl in _REDACT_RULES:
         out = pattern.sub(repl, out)
     return out
@@ -1090,7 +1093,10 @@ def redact_obj(value: Any) -> Any:
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, dict):
-        return {key: redact_obj(item) for key, item in value.items()}
+        return {
+            (redact(key) if isinstance(key, str) else key): redact_obj(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [redact_obj(item) for item in value]
     if isinstance(value, tuple):
@@ -1165,18 +1171,20 @@ def _current_branch(directory: Optional[str]) -> Optional[str]:
         ["symbolic-ref", "--short", "HEAD"],
         ["rev-parse", "--abbrev-ref", "HEAD"],
     ):
+        limit = evidence.hook_timeout(_REMOTE_TIMEOUT_S)
+        if limit is None:
+            return None
         try:
             proc = subprocess.run(
                 [evidence.git_binary() or "git", "-C", here, *args],
                 env=evidence.hardened_env(),
                 capture_output=True,
-                text=True,
-                timeout=_REMOTE_TIMEOUT_S,
+                timeout=limit,
             )
         except (OSError, subprocess.SubprocessError):
             return None
         if proc.returncode == 0:
-            branch = (proc.stdout or "").strip()
+            branch = evidence.decode_output(proc.stdout).strip()
             if branch and branch != "HEAD":
                 return branch
     return None
@@ -1772,6 +1780,9 @@ def _git_output_checked(directory: Optional[str], args: List[str]) -> Optional[s
     # From the top of the working tree: ``--name-only`` prints root-relative paths, and they
     # come back here as pathspecs, which git reads relative to the directory it runs in.
     here = evidence.repo_root(directory) or directory or os.getcwd()
+    limit = evidence.hook_timeout(_GIT_TIMEOUT_S)
+    if limit is None:
+        return None
     try:
         # Filter drivers run when a racily clean file is re-hashed for a diff, and paths taken
         # from the diff are passed back as literal names, not pathspec magic or globs.
@@ -1784,14 +1795,13 @@ def _git_output_checked(directory: Optional[str], args: List[str]) -> Optional[s
             [evidence.git_binary() or "git", "-C", here, *args],
             env=env,
             capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_S,
+            timeout=limit,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
         return None
-    return proc.stdout or ""
+    return evidence.decode_output(proc.stdout)
 
 
 def _diff_base(directory: Optional[str], base: Optional[str]) -> str:
