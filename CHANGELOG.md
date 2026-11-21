@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-11-20
+
+### Security
+
+- Staleness compares full tree ids. The name was cut to 48 bits (44 for a folded name), and
+  the agent writes both the code a green run sees and the code it swaps in, so a birthday
+  search for two versions with one name took 34 s in plain Python. `hash` is now the full git
+  tree id, or a full SHA-256 when something is folded in; `short` is for display. A run
+  recorded by an earlier version reads as stale once ([evidence.py](./evidence.py)).
+- An edit behind a symlink changes the fingerprint wherever the link points. With
+  `src/impl.py -> /elsewhere/impl.py`, `-> ../build/impl.py` (ignored), `-> ../.git/impl.py`,
+  `-> __pycache__/impl.py` or an absolute link to prose in the tree, the target could change
+  after a green run unseen. A target is skipped only when it is a file the reading hashed from
+  disk; otherwise its bytes, a directory's files (links inside followed the same way, each
+  target read once), `absent` for a dangling link, or the file type of a FIFO or device (never
+  opened) go into the name. A link named like a cache (`.venv`, `venv`, `node_modules`) is a
+  cache, as the directory would be. Walks leave out the tree itself, its git directory and the
+  stat cache. Past 20,000 files and directories, 512 MiB read, or the deadline, the tree gets no
+  fingerprint, never a partial one. Links inside nested repositories are followed too.
+- git's output is read as bytes and decoded as the filesystem encodes paths (filesystem
+  encoding, surrogateescape), not by the locale and without newline translation. Under a
+  Latin-1 locale on a UTF-8 filesystem every non-ASCII path read back as a file that did not
+  exist, and a name holding a carriage return (`helper\r.py`) read back as `helper\n.py`; either
+  could change unseen. A name the filesystem encoding cannot decode is read as the file it
+  names, and is written as `\udcXX` wherever text leaves the plugin: the ledger, the checks
+  log, kanban comments, the auxiliary audit, the pre-verify message and the notice appended to
+  an answer. Finding ids keep such names apart ([tripwires.py](./tripwires.py),
+  [__init__.py](./__init__.py)).
+- A directory that can be searched but not listed (mode `0311`) is no fingerprint. `os.walk`
+  skipped it and `git ls-files --others` only warned and exited 0, while Python still imports
+  a file in it by name.
+- Readings cannot hold a hook past its budget or stop it with an exception. The reading at
+  first sight of a repository and the check-time readings run on a bounded thread like the
+  pre-run reading, link resolution has its own bound (an automount can block in the kernel),
+  walks check the deadline per directory (a tree of empty directories has no file to check
+  at), and any failure, including the `RecursionError` Python 3.11's `realpath` raises on a
+  long symlink chain, is an unread tree. Before, that exception aborted `post_tool_call` before
+  the repository was registered and left `pre_verify` failing open.
+
+### Changed
+
+- Fingerprint names are full length, and a repository with a symlink that leaves the tree (an
+  untracked virtualenv's `bin/python`, for one) gets a different name once.
+
 ## [0.8.1] - 2026-11-20
 
 ### Security

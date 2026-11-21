@@ -182,6 +182,15 @@ never clear them.
   - A file missing from disk counts as deleted, whatever the index marks say. A sparse checkout
     reads as deleted files, the same way every time.
   - A code file that is a symlink to a prose file makes that file code.
+  - A symlink adds what it points at unless the target is a file the reading already
+    hashed: a file outside the tree, an ignored file, one under `.git/` or a cache. That is
+    the file's bytes, or every file of a directory, following the links inside it. A
+    dangling link counts as `absent` until its target appears. A link named like a cache
+    (`.venv`, `node_modules`) is a cache. Past 20,000 files and directories or 512 MiB
+    behind links the tree gets no fingerprint.
+  - Paths from git are read as bytes and decoded as the filesystem encodes them, whatever
+    the locale. A directory that can be searched but not listed means no fingerprint.
+  - Names are full-length ids, so two trees cannot be made to share one.
   - A repository whose config points git at another working tree, or that git refuses to read,
     gets no fingerprint rather than a weaker one.
   - Git itself is run from a root-owned path when the `git` on `PATH` is a file your user can
@@ -488,7 +497,8 @@ against reviewed outcomes once there are enough of them.
 - Code that the tests load from a file the fingerprint leaves out is not covered: prose files
   read as code by other code, anything a `.gitignore` ignores, caches (a `__pycache__` holding
   a hash-based `.pyc` that Python never checks against its source), and files outside the
-  repository (an installed package, a virtualenv's `.pth`).
+  repository that no symlink in it points at (an installed package, a virtualenv's
+  `.pth`).
 - Anything the session started in the background before a test command can still change the
   tree during the run.
 - Installed packages are outside the fingerprint: an edit inside `.venv/` or `node_modules/`
