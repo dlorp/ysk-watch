@@ -30,6 +30,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
@@ -622,6 +623,10 @@ _STAT_CACHE_VERSION = 2
 # timestamp tick; it is hashed again next time rather than remembered.
 _RACY_NS = 2_000_000_000
 _HASH_CHUNK = 1 << 20
+# Files not in the stat cache are hashed on this many threads: reads and hashlib both release
+# the GIL, so a first fingerprint of a large tree is bound by the disk, not one core.
+_HASH_WORKERS = 4
+_PARALLEL_MIN_FILES = 16
 _MAX_CACHE_BYTES = 64 * 1024 * 1024
 _OBJECT_FORMATS = {"sha1": 40, "sha256": 64}
 _MODES = frozenset({"100644", "100755", "120000"})
@@ -767,6 +772,138 @@ def _hash_file(
         os.close(fd)
 
 
+def _hash_files(
+    items: List[Tuple[str, os.stat_result]], algo: str, deadline: Optional[float]
+) -> List[Optional[str]]:
+    """``_hash_file`` over many files, on the calling thread and up to ``_HASH_WORKERS - 1``
+    daemon threads.
+
+    Results are in the order of ``items``. The threads are daemons, and every file read and
+    every claim of the next file checks the deadline, so a caller that stops waiting (the
+    pre-run hook's budget) never holds the interpreter open. When no thread can be started the
+    calling thread hashes everything.
+    """
+    results: List[Optional[str]] = [None] * len(items)
+    if len(items) < _PARALLEL_MIN_FILES:
+        for i, (full, info) in enumerate(items):
+            results[i] = _hash_file(full, info, algo, deadline)
+        return results
+    lock = threading.Lock()
+    position = [0]
+
+    def work() -> None:
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                return  # the rest stay None: unread, as at the deadline in _hash_file
+            with lock:
+                i = position[0]
+                position[0] += 1
+            if i >= len(items):
+                return
+            full, info = items[i]
+            try:
+                results[i] = _hash_file(full, info, algo, deadline)
+            except Exception:  # a worker must never die silently with work left unclaimed
+                results[i] = None
+
+    started = []
+    for _ in range(min(_HASH_WORKERS, len(items)) - 1):
+        thread = threading.Thread(target=work, name="ysk-watch-hash", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:  # no thread to be had: the calling thread does the rest
+            break
+        started.append(thread)
+    work()
+    for thread in started:
+        thread.join()
+    return results
+
+
+# Index modes as git records them (``create_ce_mode``): any other regular-file mode keeps
+# only its owner-execute bit, so ``100664`` is ``100644`` and ``100775`` is ``100755``.
+_TREE_MODES = {
+    "100644": b"100644",
+    "100755": b"100755",
+    "120000": b"120000",
+    "160000": b"160000",
+}
+_REGULAR_MODE_RE = re.compile(r"100[0-7]{3}")
+
+
+def _tree_mode(mode: str) -> Optional[bytes]:
+    known = _TREE_MODES.get(mode)
+    if known is None and _REGULAR_MODE_RE.fullmatch(mode):
+        known = b"100755" if int(mode, 8) & 0o100 else b"100644"
+    return known
+
+
+def _tree_id(
+    entries: Dict[str, Tuple[str, str]], algo: str
+) -> Optional[Tuple[str, List[Tuple[str, str, str]]]]:
+    """The tree id of ``entries`` in git's tree format, and the entries no tree can hold.
+
+    Built in memory, as ``git write-tree`` builds it: entries sorted by name with a directory
+    compared as ``name/``, each ``<mode> <name>NUL<raw id>``. For every set of entries git
+    accepts, the id is the one git writes. git would also drop some entries without failing:
+    names it refuses (``.git`` in an HFS or NTFS spelling, ``git~1``, a symlinked
+    ``.gitmodules``) and one side of a name that is both a file and a directory. Here the first
+    kind is part of the tree like any other name, and the second is returned beside the id
+    (``(path, mode, oid)``) so the caller can fold it into the name: a file git would ignore
+    still changes the fingerprint when it changes.
+
+    ``None`` for a mode no index records or a malformed object id.
+    """
+    width = _OBJECT_FORMATS.get(algo)
+    if width is None:
+        return None
+    hex_id = re.compile(f"[0-9a-f]{{{width}}}")
+    root: Dict[str, Any] = {}
+    clashes: List[Tuple[str, str, str]] = []
+    try:
+        # Sorted, so which side of a file/directory clash lands in the tree never depends on
+        # the order the listings came in.
+        for path, (mode, oid) in sorted(entries.items()):
+            mode_bytes = _tree_mode(mode)
+            # git refuses the null id ("cache entry has null sha1"), so no tree holds it.
+            if mode_bytes is None or not hex_id.fullmatch(oid) or not oid.strip("0"):
+                return None
+            *dirs, name = path.split("/")
+            node: Any = root
+            for part in dirs:
+                child = node.get(part)
+                if child is None:
+                    child = node[part] = {}
+                elif not isinstance(child, dict):
+                    node = None
+                    break
+                node = child
+            if node is None or name in node:
+                clashes.append((path, mode, oid))
+                continue
+            node[name] = (mode_bytes, bytes.fromhex(oid))
+        return _hash_tree(root, algo).hex(), clashes
+    except RecursionError:
+        return None
+
+
+def _hash_tree(node: Dict[str, Any], algo: str) -> bytes:
+    """The binary id of one tree object, its subtrees hashed first."""
+    items = []
+    for name, value in node.items():
+        raw = name.encode("utf-8", "surrogateescape")
+        if isinstance(value, dict):
+            items.append((raw + b"/", b"40000", raw, _hash_tree(value, algo)))
+        else:
+            items.append((raw, value[0], raw, value[1]))
+    items.sort(key=lambda item: item[0])
+    body = b"".join(mode + b" " + raw + b"\0" + oid for _, mode, raw, oid in items)
+    digest = hashlib.new(algo)
+    digest.update(b"tree %d\0" % len(body))
+    digest.update(body)
+    return digest.digest()
+
+
 def _hash_symlink(path: str, algo: str) -> Optional[str]:
     """A symlink's blob is its target text, as git stores it."""
     try:
@@ -858,11 +995,20 @@ def _nested_entry(
     the outer name; its own ``.gitignore`` hides nothing. The commit is its HEAD when it has
     one, else the one the outer tree records.
     """
+    if deadline is not None and time.monotonic() > deadline:
+        return None
+
+    def bounded(args: List[str]) -> str:
+        # The nested repository's config is the agent's to write (an include of a FIFO blocks
+        # git), so each call gets only what is left of the deadline.
+        ok, out = _run_git(path, args, timeout=_remaining(deadline, _GIT_TIMEOUT_S))
+        return out if ok else ""
+
     head = ""
     if os.path.lexists(os.path.join(path, ".git")):
-        toplevel = git(path, ["rev-parse", "--show-toplevel"]).strip()
+        toplevel = bounded(["rev-parse", "--show-toplevel"]).strip()
         if toplevel and os.path.realpath(toplevel) == os.path.realpath(path):
-            head = git(path, ["rev-parse", "--verify", "-q", "HEAD"]).strip()
+            head = bounded(["rev-parse", "--verify", "-q", "HEAD"]).strip()
     digest = _plain_dir_digest(path, algo, deadline, cache, fresh, prefix)
     if digest is None:
         return None
@@ -915,9 +1061,11 @@ def tree_fingerprint(
     marks do not hide a file. The untracked listing is taken against a throwaway index read
     from HEAD, so an index that calls a directory a submodule hides nothing in it. Only
     ``.gitignore`` files hide an untracked file; one that ignores itself counts as content.
-    The entries go into a throwaway index whose tree is written to a throwaway object
-    directory, and that tree id is the fingerprint. The repository's own index and object
-    store are only read. Unchanged files are recognized by the watcher's own stat cache.
+    The tree id of those entries is the fingerprint, computed in memory as ``git write-tree``
+    would. Names git would drop (an HFS or NTFS spelling of ``.git``, a file where a directory
+    is) still count; nothing is handed to git to build.
+    The repository's own index and object store are only read. Unchanged files are recognized
+    by the watcher's own stat cache; the rest are hashed on a few threads.
 
     The name depends on file contents and nothing else: ``git add`` and ``git commit`` after
     a green run leave it unchanged, while any content change, however it was made, changes
@@ -947,23 +1095,34 @@ def tree_fingerprint(
     filters = filter_overrides(root)
     if filters is None:
         return None
-    head_entries = _head_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S))
-    index_entries = _index_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S))
-    if head_entries is None or index_entries is None:
-        return None
     try:
         _sweep_stale_temp_dirs()
         with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
+            head_env = dict(_base_env(), GIT_INDEX_FILE=os.path.join(tmp, "head-index"))
+            # Three independent reads of the repository, run side by side.
+            head_entries, index_entries, read_head = _concurrently(
+                lambda: _head_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S)),
+                lambda: _index_entries(root, filters, _remaining(deadline, _STAGE_TIMEOUT_S)),
+                lambda: _run_git(
+                    root,
+                    ["read-tree", "HEAD"],
+                    env=head_env,
+                    timeout=_remaining(deadline, _STAGE_TIMEOUT_S),
+                    extra_config=filters,
+                )[0],
+            )
+            if head_entries is None or index_entries is None or read_head is not True:
+                return None
             return _fingerprint_in(
                 tmp,
                 root,
                 head,
                 git_dir,
-                objects_path,
                 algo,
                 filters,
                 head_entries,
                 index_entries,
+                head_env,
                 include_docs,
                 deadline,
             )
@@ -971,38 +1130,58 @@ def tree_fingerprint(
         return None
 
 
+def _base_env() -> Dict[str, str]:
+    """The inherited environment without the variables that point git at another repository."""
+    env = dict(os.environ)
+    env.pop("GIT_DIR", None)
+    env.pop("GIT_WORK_TREE", None)
+    return env
+
+
+def _concurrently(*calls: Any) -> List[Any]:
+    """Run independent calls on daemon threads; each result, or ``None`` if it raised."""
+    results: List[Any] = [None] * len(calls)
+
+    def run(i: int) -> None:
+        try:
+            results[i] = calls[i]()
+        except Exception:
+            results[i] = None
+
+    started = []
+    for i in range(len(calls)):
+        thread = threading.Thread(target=run, args=(i,), name="ysk-watch-git", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:  # no thread to be had: run it here instead
+            run(i)
+            continue
+        started.append(thread)
+    for thread in started:
+        thread.join()
+    return results
+
+
 def _fingerprint_in(
     tmp: str,
     root: str,
     head: str,
     git_dir: str,
-    objects_path: str,
     algo: str,
     filters: Tuple[Tuple[str, str], ...],
     head_entries: Dict[str, Tuple[str, str]],
     index_entries: Dict[str, Tuple[str, str, str]],
+    head_env: Dict[str, str],
     include_docs: bool,
     deadline: Optional[float],
 ) -> Optional[Dict[str, Any]]:
-    """``tree_fingerprint``'s work, with ``tmp`` as the scratch directory."""
-    temp_objects = os.path.join(tmp, "objects")
-    os.mkdir(temp_objects)
-    base_env = dict(os.environ)
-    base_env.pop("GIT_DIR", None)
-    base_env.pop("GIT_WORK_TREE", None)
-    head_env = dict(base_env, GIT_INDEX_FILE=os.path.join(tmp, "head-index"))
-    ok, _ = _run_git(
-        root,
-        ["read-tree", "HEAD"],
-        env=head_env,
-        timeout=_remaining(deadline, _STAGE_TIMEOUT_S),
-        extra_config=filters,
-    )
-    if not ok:
-        return None
-    listed = _untracked_paths(root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S))
-    gitignores = _ignored_gitignores(
-        root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S)
+    """``tree_fingerprint``'s work, with ``tmp`` as the scratch directory and ``head_env``'s
+    index already read from HEAD."""
+    listed, gitignores = _concurrently(
+        lambda: _untracked_paths(root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S)),
+        lambda: _ignored_gitignores(
+            root, filters, head_env, _remaining(deadline, _STAGE_TIMEOUT_S)
+        ),
     )
     if listed is None or gitignores is None:
         return None
@@ -1033,17 +1212,43 @@ def _fingerprint_in(
         if fresh:
             _save_stat_cache(cache_path, {**cache, **fresh})
 
-    real_root = os.path.realpath(root)
-    for path in candidates:
-        if _CACHE_PATH_RE.search(path):
-            continue
-        if deadline is not None and time.monotonic() > deadline:
+    linked: Dict[str, bool] = {}
+
+    def under_link(parent: str) -> bool:
+        """Whether ``parent`` or a directory between it and the root is a symlink.
+
+        Each directory is looked at once (one ``lstat``) however many paths sit under it.
+        ``realpath`` per path did the same check with one ``lstat`` per component per path.
+        """
+        if not parent:
+            return False
+        chain = []
+        here = parent
+        while here and here not in linked:
+            chain.append(here)
+            here = os.path.dirname(here)
+        known = linked[here] if here else False
+        for directory in reversed(chain):
+            known = known or os.path.islink(os.path.join(root, directory))
+            linked[directory] = known
+        return linked[parent]
+
+    def remember(path: str, info: os.stat_result, key: List[Any], oid: str) -> None:
+        if now_ns - info.st_mtime_ns > _RACY_NS and now_ns - info.st_ctime_ns > _RACY_NS:
+            fresh[path] = key + [oid]
+
+    # Regular files the stat cache does not vouch for, hashed together after the walk.
+    pending: List[Tuple[str, str, os.stat_result, str, List[Any]]] = []
+    for walked, path in enumerate(candidates):
+        # The walk only stats files, so the deadline is checked every few hundred paths (and
+        # before each nested repository); the hashing that follows checks it on every read and
+        # keeps what it finished.
+        if deadline is not None and walked % 256 == 0 and time.monotonic() > deadline:
             give_up()
             return None
-        parent = os.path.dirname(path)
-        if parent and os.path.realpath(os.path.join(root, parent)) != os.path.join(
-            real_root, parent
-        ):
+        if _CACHE_PATH_RE.search(path):
+            continue
+        if under_link(os.path.dirname(path)):
             # An ancestor is a symlink (a directory replaced by a link): the link itself is the
             # entry, as with ``git add -A``; what it points at is outside this tree.
             continue
@@ -1079,17 +1284,28 @@ def _fingerprint_in(
         cached = cache.get(path)
         if cached is not None and cached[:6] == key:
             oid = cached[6]
-        else:
-            if mode == "120000":
-                oid = _hash_symlink(full, algo)
-            else:
-                oid = _hash_file(full, info, algo, deadline)
+        elif mode == "120000":
+            oid = _hash_symlink(full, algo)
             if oid is None:
                 give_up()
                 return None
+        else:
+            pending.append((path, full, info, mode, key))
+            continue
         entries[path] = (mode, oid)
-        if now_ns - info.st_mtime_ns > _RACY_NS and now_ns - info.st_ctime_ns > _RACY_NS:
-            fresh[path] = key + [oid]
+        remember(path, info, key, oid)
+    if pending:
+        oids = _hash_files([(full, info) for _, full, info, _, _ in pending], algo, deadline)
+        unread = False
+        for (path, _, info, mode, key), hashed in zip(pending, oids):
+            if hashed is None:
+                unread = True  # changed while read, unreadable, or the deadline passed
+                continue
+            entries[path] = (mode, hashed)
+            remember(path, info, key, hashed)
+        if unread:
+            give_up()
+            return None
     for path in nested_repos:
         # An untracked repository inside the checkout: importable code, not committed here.
         sub = _nested_entry(os.path.join(root, path), "", algo, deadline, cache, fresh, path + "/")
@@ -1104,35 +1320,10 @@ def _fingerprint_in(
     if fresh != cache:
         _save_stat_cache(cache_path, fresh)
 
-    env = dict(
-        base_env,
-        GIT_INDEX_FILE=os.path.join(tmp, "index"),
-        GIT_OBJECT_DIRECTORY=temp_objects,
-        GIT_ALTERNATE_OBJECT_DIRECTORIES=objects_path,
-    )
-    # Every entry by mode and object id: git hashes nothing here. The blobs were never
-    # written; ``--missing-ok`` lets the tree name them anyway.
-    info_lines = "".join(f"{mode} {oid}\t{path}\0" for path, (mode, oid) in sorted(entries.items()))
-    ok, _ = _run_git(
-        root,
-        ["update-index", "-z", "--index-info"],
-        env=env,
-        timeout=_remaining(deadline, _STAGE_TIMEOUT_S),
-        input=info_lines,
-        extra_config=filters,
-    )
-    if not ok:
+    built = _tree_id(entries, algo)
+    if built is None:
         return None
-    ok, tree = _run_git(
-        root,
-        ["write-tree", "--missing-ok"],
-        env=env,
-        timeout=_remaining(deadline, _GIT_TIMEOUT_S),
-        extra_config=filters,
-    )
-    tree = tree.strip()
-    if not ok or not tree:
-        return None
+    tree, clashes = built
 
     changes = {
         path: (entries[path][1] if path in entries else "", path in head_entries)
@@ -1142,8 +1333,11 @@ def _fingerprint_in(
     changed = sorted(path for path in changes if include_docs or not is_doc(path))
     changed += sorted(path for path, _ in nested if path.endswith("/"))
     name = tree[:12]
-    if nested:
+    if nested or clashes:
         folded = tree + "".join(f"\n{path}\0{inner}" for path, inner in sorted(nested))
+        # Entries no tree can hold (a file where a directory is). The \x01 marker keeps them
+        # apart from the nested digests.
+        folded += "".join(f"\n\x01{path}\0{mode}\0{oid}" for path, mode, oid in clashes)
         name = "s" + hashlib.sha256(folded.encode("utf-8", "surrogateescape")).hexdigest()[:11]
     return {
         "hash": name,

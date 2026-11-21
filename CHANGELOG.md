@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-11-20
+
+### Security
+
+- Files git would quietly drop now count. The tree went through `git update-index
+  --index-info`, which skips a path it refuses (`.git.`, `.git `, `git~1`, `.g\u200cit`,
+  `.git :x`) with only an `Ignoring path` warning, and keeps one side of a name that is both a
+  file and a directory, both with exit status 0. Code under such a directory, or a `calc.py`
+  put where HEAD had a `calc.py/` of prose, could change after a green run with the
+  fingerprint unchanged. The tree is now built in memory with every entry in it; a file where
+  a directory is goes into the name beside the tree. Tree ids are unchanged for every
+  repository without such names ([evidence.py](./evidence.py)).
+- A nested repository or submodule whose config blocks git (an include of a FIFO) no longer
+  holds the fingerprint past its deadline. Each of its git calls got a fixed 5 s, so four of
+  them took a 2 s reading to 20 s and returned a name; the reading now stops at the deadline.
+- A process that cannot start a thread hashes on the calling thread instead of failing.
+
+### Fixed
+
+- The fingerprint is as fast as 0.6.1's again. 0.8.0 took 3.8 s to name an unchanged
+  44,000-path repository whose files were all in the stat cache, against 1.5 s before; it now
+  takes 1.55 s, and a first fingerprint takes 7.3 s instead of 16 s:
+  - The tree id is computed in memory, as `git write-tree` computes it, instead of by
+    `update-index` and `write-tree` into a throwaway object directory, which wrote and then
+    deleted one object for every new directory.
+  - The symlinked-directory check looks at each directory once, not every component of every
+    path.
+  - Files the stat cache does not vouch for are hashed on four threads after the walk, and
+    stop being claimed at the deadline. The walk checks the deadline every 256 paths and
+    before each nested repository, and hashing keeps what it finished.
+  - The independent git reads (HEAD's tree, the index, the HEAD index, the two untracked
+    listings) run side by side.
+
 ## [0.8.0] - 2026-11-04
 
 ### Security

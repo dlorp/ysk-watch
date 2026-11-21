@@ -140,8 +140,8 @@ never clear them.
 
 - **Tree fingerprint.** A passing test run is credited with the working tree it ran on, named
   by its content. Every path in HEAD, in the index and untracked (not ignored) is read from
-  disk and hashed raw, the entries go into a throwaway index, and that index's git tree id is
-  the name. When the turn asks to finish, the tree is named again. Same name, the evidence is
+  disk and hashed raw, and the git tree id of those entries (computed as `git write-tree`
+  would) is the name. When the turn asks to finish, the tree is named again. Same name, the evidence is
   current whatever happened in between, including `git add` and `git commit`. Different name,
   it is stale, even when every edit went through `sed -i`, a script, or a subagent no edit hook
   saw. Prose files (`.md`, `.rst`, `.adoc`) keep their HEAD version on both sides.
@@ -481,8 +481,9 @@ against reviewed outcomes once there are enough of them.
   file and the old object id, can hide the edit. This is the same trust as `config.yaml` above:
   run unattended agents where they cannot write `$HERMES_HOME`. A cache file that is not a
   plain, valid one is ignored and the files are hashed again.
-- The first fingerprint of a large repository hashes every file: about 14 s for 2.7 GB. A test
-  run whose earlier tree cannot be read within 8 s gets no tree. Progress is kept, so later runs
+- The first fingerprint of a large repository hashes every file, on four threads: about 7 s
+  for a 44,000-path repository on an external SSD. A test run whose earlier tree cannot be
+  read within 8 s gets no tree. Progress is kept, so later runs
   are fast.
 - Code that the tests load from a file the fingerprint leaves out is not covered: prose files
   read as code by other code, anything a `.gitignore` ignores, caches (a `__pycache__` holding
