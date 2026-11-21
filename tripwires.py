@@ -927,6 +927,9 @@ def _resolve_push_urls(directory: str, remote: str) -> List[str]:
     send a push somewhere other than where fetches come from, and a push goes to every
     ``pushurl``. Read-only, no network, bounded; empty on any error.
     """
+    limit = evidence.hook_timeout(_REMOTE_TIMEOUT_S)
+    if limit is None:
+        return []
     try:
         proc = subprocess.run(
             [
@@ -937,7 +940,7 @@ def _resolve_push_urls(directory: str, remote: str) -> List[str]:
             ],
             env=evidence.hardened_env(),
             capture_output=True,
-            timeout=_REMOTE_TIMEOUT_S,
+            timeout=limit,
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -1168,12 +1171,15 @@ def _current_branch(directory: Optional[str]) -> Optional[str]:
         ["symbolic-ref", "--short", "HEAD"],
         ["rev-parse", "--abbrev-ref", "HEAD"],
     ):
+        limit = evidence.hook_timeout(_REMOTE_TIMEOUT_S)
+        if limit is None:
+            return None
         try:
             proc = subprocess.run(
                 [evidence.git_binary() or "git", "-C", here, *args],
                 env=evidence.hardened_env(),
                 capture_output=True,
-                timeout=_REMOTE_TIMEOUT_S,
+                timeout=limit,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -1774,6 +1780,9 @@ def _git_output_checked(directory: Optional[str], args: List[str]) -> Optional[s
     # From the top of the working tree: ``--name-only`` prints root-relative paths, and they
     # come back here as pathspecs, which git reads relative to the directory it runs in.
     here = evidence.repo_root(directory) or directory or os.getcwd()
+    limit = evidence.hook_timeout(_GIT_TIMEOUT_S)
+    if limit is None:
+        return None
     try:
         # Filter drivers run when a racily clean file is re-hashed for a diff, and paths taken
         # from the diff are passed back as literal names, not pathspec magic or globs.
@@ -1786,7 +1795,7 @@ def _git_output_checked(directory: Optional[str], args: List[str]) -> Optional[s
             [evidence.git_binary() or "git", "-C", here, *args],
             env=env,
             capture_output=True,
-            timeout=_GIT_TIMEOUT_S,
+            timeout=limit,
         )
     except (OSError, subprocess.SubprocessError):
         return None

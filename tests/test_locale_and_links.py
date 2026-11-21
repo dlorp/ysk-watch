@@ -415,3 +415,106 @@ def test_an_unreadable_directory_is_caught_whatever_language_git_speaks(
         assert evidence.tree_fingerprint(str(repo)) is None
     finally:
         hidden.chmod(0o755)
+
+
+# --- final pass: hook budget, prose links, relocated git dirs, lstat errors, sharing -----------
+
+
+@pytest.fixture
+def plugin(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("YSK_WATCH_AUX", "0")
+    return _load("ysk_final_pass", "__init__.py")
+
+
+def test_git_calls_stop_at_the_hook_deadline(evidence, repo):
+    import time
+
+    fifo = repo.parent / "blocking-include"
+    os.mkfifo(fifo)
+    with open(repo / ".git" / "config", "a", encoding="utf-8") as fh:
+        fh.write(f"[include]\n\tpath = {fifo}\n")
+    start = time.monotonic()
+    with evidence.hook_deadline(1.0):
+        results = [evidence._run_git(str(repo), ["status"]) for _ in range(10)]
+    assert time.monotonic() - start < 2.5
+    assert all(ok is False for ok, _ in results)
+
+
+def test_a_spent_hook_deadline_starts_no_git(evidence, repo):
+    with evidence.hook_deadline(0.0):
+        assert evidence._run_git(str(repo), ["rev-parse", "HEAD"]) == (False, "")
+    assert evidence._run_git(str(repo), ["rev-parse", "HEAD"])[0] is True
+
+
+def test_check_readings_end_with_their_budget(plugin, repo):
+    import time
+
+    assert plugin._check_reading(str(repo), time.monotonic() - 1) is None
+    assert plugin._check_reading(str(repo), time.monotonic() + 20)["hash"]
+
+
+def test_a_prose_named_link_to_a_directory_is_followed(evidence, repo, tmp_path):
+    out = tmp_path / "libdir"
+    out.mkdir()
+    (out / "mod.py").write_text("X = 1\n")
+    os.symlink(out, repo / "lib.md")
+    before = evidence.tree_fingerprint(str(repo))
+    (out / "mod.py").write_text("X = 2\n")
+    assert evidence.tree_fingerprint(str(repo))["hash"] != before["hash"]
+
+
+def test_a_prose_link_to_prose_keeps_the_prose_rule(evidence, repo, tmp_path):
+    (tmp_path / "shared.md").write_text("# one\n")
+    os.symlink(tmp_path / "shared.md", repo / "SHARED.md")
+    fingerprint = evidence.tree_fingerprint(str(repo))
+    assert fingerprint["hash"] == fingerprint["tree"]
+
+
+def test_a_relocated_git_dir_met_in_a_followed_directory_is_no_fingerprint(
+    evidence, repo, tmp_path
+):
+    import shutil
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.move(str(repo / ".git"), str(outside / "gd"))
+    (repo / ".git").write_text(f"gitdir: {outside / 'gd'}\n")
+    (outside / "gd" / "evil.py").write_text("E = 1\n")
+    os.symlink(outside, repo / "src" / "pkg")
+    assert evidence.tree_fingerprint(str(repo)) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root looks into any directory")
+def test_a_link_target_that_cannot_be_looked_at_is_unknown(evidence, repo, tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "t.py").write_text("T = 1\n")
+    os.symlink(locked / "t.py", repo / "src" / "t.py")
+    locked.chmod(0o000)
+    try:
+        assert evidence.tree_fingerprint(str(repo)) is None
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_reading_its_owner_gave_up_on_is_never_shared(plugin, tmp_path, monkeypatch):
+    started = []
+
+    def late(directory, budget, on_done=None, grace=1.0):
+        started.append(on_done)
+        return None  # the owner's wait ends before the reading does
+
+    monkeypatch.setattr(plugin, "_bounded_fingerprint", late)
+    led = {"pre_inflight": {}}
+    assert plugin._shared_pre_run_tree(led, "k", str(tmp_path)) is None
+    assert led["pre_inflight"] == {}
+    started[0]({"hash": "stale"})  # the reading finishes after its command ran
+    assert plugin._shared_pre_run_tree(led, "k", str(tmp_path)) is None
+    assert len(started) == 2  # a fresh reading, not the stale one
+
+
+def test_ids_take_any_string(plugin):
+    assert plugin._pre_run_key("", {"command": "echo \ud800 \udcff"}).startswith("cmd:")

@@ -43,6 +43,20 @@ All notable changes to this project are documented here. The format follows
   long symlink chain, is an unread tree. Before, that exception aborted `post_tool_call` before
   the repository was registered and left `pre_verify` failing open.
 
+- The stop hooks (`pre_verify`, `transform_llm_output`, `post_tool_call`) share one 25 s
+  budget that every git call takes its timeout from, and none starts once it is spent. The diff
+  scans made several 5 s calls each on the hook thread: against a repository whose config
+  blocks git, `pre_verify` took 90 s, past Hermes's 30 s abandon, which lets the answer through
+  and skips the hook for the next 60 s. Check-time readings get only what is left, with no
+  grace per repository.
+- A prose-named symlink (`lib.md -> /elsewhere`) is followed; a prose file it points at keeps
+  the prose rule. A git directory moved out of the tree and met inside a followed directory
+  means no fingerprint. A link target that cannot be looked at (a locked parent) is unknown,
+  not `absent`.
+- A pre-run reading its owner stopped waiting for is abandoned: it finished after the owner's
+  command ran, so a later test call no longer shares it.
+- Finding ids and pre-run keys encode with `surrogatepass`, which takes any string.
+
 ### Changed
 
 - Fingerprint names are full length, and a repository with a symlink that leaves the tree (an

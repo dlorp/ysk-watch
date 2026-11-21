@@ -21,6 +21,8 @@ files the index has been told to stop looking at are looked at anyway.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -205,6 +207,36 @@ GIT_TEXT: Dict[str, str] = {
 }
 
 
+# One deadline for everything a hook does on its own thread. Hermes abandons a hook that runs
+# past 30 s and lets the answer through, and the diff scans make several git calls of 5 s
+# each: against a repository whose config blocks git that came to 90 s. Every git call made
+# under ``hook_deadline`` gets only what is left, and none starts once it is spent.
+_hook = threading.local()
+
+
+@contextlib.contextmanager
+def hook_deadline(seconds: float) -> Any:
+    """Bound every git call on this thread to ``seconds`` from now (nested: the earlier wins)."""
+    previous = getattr(_hook, "deadline", None)
+    mine = time.monotonic() + seconds
+    _hook.deadline = mine if previous is None else min(previous, mine)
+    try:
+        yield
+    finally:
+        _hook.deadline = previous
+
+
+def hook_timeout(timeout: float) -> Optional[float]:
+    """``timeout`` cut to the hook's remaining time; ``None`` when nothing is left."""
+    deadline = getattr(_hook, "deadline", None)
+    if deadline is None:
+        return timeout
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return None
+    return min(timeout, left)
+
+
 def decode_output(data: Optional[bytes]) -> str:
     """git's output as text, decoded by ``GIT_TEXT``.
 
@@ -240,6 +272,10 @@ def _run_git(
     """Run git; ``(succeeded, stdout)``. ``stderr_fails`` names warnings that make the call a
     failure although git exits 0 (a directory it could not read, for one)."""
     here = directory or os.getcwd()
+    limit = hook_timeout(timeout)
+    if limit is None:
+        return False, ""  # the hook's time is spent: a failed call, not a clean answer
+    timeout = limit
     run_env = hardened_env(env, extra_config)
     if stderr_fails:
         # The markers are git's English messages; gettext would translate them. Paths are
@@ -994,6 +1030,7 @@ def _plain_dir_digest(
     budget: Optional[List[int]] = None,
     prune: Optional["set[str]"] = None,
     covered: Optional[Any] = None,
+    forbidden: Optional["set[str]"] = None,
 ) -> Optional[str]:
     """Content of a directory as one digest, every file in it; ``""`` when empty.
 
@@ -1004,7 +1041,8 @@ def _plain_dir_digest(
     ``found_links`` so the caller can follow the ones that leave the tree. ``budget`` is
     ``[files, bytes]`` still allowed (bytes count only files hashed now, so a reading cut off
     by it resumes); past it the digest is ``None``. Directories in ``prune`` are not entered,
-    and files ``covered(full_path)`` vouches for are counted elsewhere and left out.
+    and files ``covered(full_path)`` vouches for are counted elsewhere and left out. Meeting
+    a directory in ``forbidden`` makes the digest ``None``.
 
     A directory that cannot be listed makes the digest ``None``: a file in it can still be
     opened by exact path.
@@ -1026,6 +1064,10 @@ def _plain_dir_digest(
         # A symlinked directory is not followed (os.walk would skip it silently): its target
         # text is hashed like a symlinked file's, so retargeting it changes the digest.
         links = [d for d in dirs if os.path.islink(os.path.join(current, d))]
+        if forbidden and (
+            current in forbidden or any(os.path.join(current, d) in forbidden for d in dirs)
+        ):
+            return None
         dirs[:] = sorted(
             d
             for d in dirs
@@ -1096,6 +1138,7 @@ def _linked_targets(
     root: str,
     git_dir: str,
     links: List[str],
+    prose_links: "set[str]",
     from_disk: "set[str]",
     algo: str,
     deadline: Optional[float],
@@ -1120,9 +1163,13 @@ def _linked_targets(
     real_root = os.path.realpath(root)
     root_prefix = os.path.join(root, "")
     real_prefix = os.path.join(real_root, "")
-    # The tree and its git directory are read by the fingerprint itself, and the stat cache is
-    # rewritten by every reading: a link to a directory holding any of them leaves them out.
-    prune = {real_root, os.path.realpath(git_dir), os.path.realpath(_cache_dir())}
+    # The tree (and a git directory inside it) is read by the fingerprint itself, and the stat
+    # cache is rewritten by every reading: a link to a directory holding them leaves them out.
+    prune = {real_root, os.path.realpath(_cache_dir())}
+    # A git directory moved out of the tree (a ``.git`` file naming it) is the agent's to fill,
+    # and a walk that meets it there has no right to skip it: no fingerprint instead.
+    real_git = os.path.realpath(git_dir)
+    forbidden = set() if real_git.startswith(real_prefix) else {real_git}
 
     def counted(full: str) -> bool:
         return full.startswith(real_prefix) and full[len(real_prefix) :] in from_disk
@@ -1141,11 +1188,13 @@ def _linked_targets(
         if digest is None:
             try:
                 info = os.lstat(target)
-            except OSError:
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                    return None  # a target that cannot be looked at is unknown, not absent
                 digest = "absent"
             else:
                 if stat.S_ISREG(info.st_mode):
-                    if counted(target):
+                    if counted(target) or (link in prose_links and is_doc(target)):
                         done[target] = ""
                         continue  # an entry of its own, hashed from disk
                     budget[0] -= 1
@@ -1191,6 +1240,7 @@ def _linked_targets(
                         # not otherwise read); one at the tree itself reads nothing new.
                         prune - {target} if target != real_root else prune,
                         counted,
+                        forbidden - {target},
                     )
                     if sub is None:
                         return None
@@ -1216,6 +1266,7 @@ def _bounded_linked_targets(
     root: str,
     git_dir: str,
     links: List[str],
+    prose_links: "set[str]",
     from_disk: "set[str]",
     algo: str,
     deadline: Optional[float],
@@ -1235,7 +1286,7 @@ def _bounded_linked_targets(
     def run() -> None:
         try:
             box["records"] = _linked_targets(
-                root, git_dir, links, from_disk, algo, deadline, cache, own
+                root, git_dir, links, prose_links, from_disk, algo, deadline, cache, own
             )
         except Exception:
             box["records"] = None
@@ -1538,6 +1589,7 @@ def _fingerprint_in(
     # Every symlink in the tree (and in nested repositories), followed after the walk, and
     # every path whose content was read from disk rather than kept from HEAD.
     symlinks: List[str] = []
+    prose_links: "set[str]" = set()
     from_disk: "set[str]" = set()
     # Regular files the stat cache does not vouch for, hashed together after the walk.
     pending: List[Tuple[str, str, os.stat_result, str, List[Any]]] = []
@@ -1557,6 +1609,12 @@ def _fingerprint_in(
         if not include_docs and is_doc(path):
             if path in head_entries:
                 entries[path] = head_entries[path]
+            # A prose-named link (``lib.md -> /elsewhere``) can still lead to code: it is
+            # followed, and a prose file it points at keeps the prose rule.
+            doc_full = os.path.join(root, path)
+            if os.path.islink(doc_full) and os.path.basename(path) not in _CACHE_NAMES:
+                symlinks.append(doc_full)
+                prose_links.add(doc_full)
             continue
         recorded_head = head_entries.get(path)
         full = os.path.join(root, path)
@@ -1630,7 +1688,7 @@ def _fingerprint_in(
         give_up()
         return None
     outside = _bounded_linked_targets(
-        root, git_dir, symlinks, from_disk, algo, deadline, cache, fresh
+        root, git_dir, symlinks, prose_links, from_disk, algo, deadline, cache, fresh
     )
     if outside is None:
         give_up()
