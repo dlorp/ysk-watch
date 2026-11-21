@@ -399,3 +399,19 @@ def test_a_cached_file_behind_a_link_still_sees_an_edit(evidence, repo, tmp_path
     target.write_text("S = 2\n")
     os.utime(target, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))  # mtime put back
     assert evidence.tree_fingerprint(str(repo))["hash"] != first["hash"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+def test_an_unreadable_directory_is_caught_whatever_language_git_speaks(
+    evidence, repo, monkeypatch
+):
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "de")
+    hidden = repo / "pkg" / "sub"
+    hidden.mkdir(parents=True)
+    (hidden / "m.py").write_text("M = 1\n")
+    hidden.chmod(0o311)
+    try:
+        assert evidence.tree_fingerprint(str(repo)) is None
+    finally:
+        hidden.chmod(0o755)

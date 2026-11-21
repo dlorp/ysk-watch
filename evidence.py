@@ -241,6 +241,10 @@ def _run_git(
     failure although git exits 0 (a directory it could not read, for one)."""
     here = directory or os.getcwd()
     run_env = hardened_env(env, extra_config)
+    if stderr_fails:
+        # The markers are git's English messages; gettext would translate them. Paths are
+        # bytes to git whatever the locale, so this changes only the message text.
+        run_env = dict(run_env, LC_ALL="C", LANGUAGE="")
     try:
         proc = subprocess.run(
             [git_binary() or "git", "-C", here, *args],
