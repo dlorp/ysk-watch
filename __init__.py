@@ -394,7 +394,7 @@ def _repo_name(directory: Optional[str]) -> str:
 def _call_dir(tool_name: str, args: Any, known_cwd: Optional[str]) -> Optional[str]:
     """Where this tool call acted: after a command's own ``cd``, or the edited file's dir."""
     if tool_name in _COMMAND_TOOLS:
-        return tripwires.command_cwd(tripwires._command_of(args), known_cwd) or known_cwd
+        return tripwires.command_cwd(tripwires._command_of(args), known_cwd)
     if isinstance(args, dict):
         for key in ("path", "file_path"):
             value = args.get(key)
@@ -669,7 +669,7 @@ def _on_pre_tool_call(
         is_code = tool_name == "execute_code" or ("code" in args and "command" not in args)
         ids = _ledger_ids(session_id, task_id)
         known_cwd = _last_cwd(ids[0])
-        run_dir = known_cwd if is_code else (tripwires.command_cwd(command, known_cwd) or known_cwd)
+        run_dir = known_cwd if is_code else tripwires.command_cwd(command, known_cwd)
         led = _ledger(ids[0])
         root = _repo_root(run_dir) if run_dir else None
         # The commit before this command runs, for every repository it names: a first command
@@ -816,8 +816,33 @@ def _on_post_tool_call(
         _note_root(led, call_dir, edited=tool_name in ("write_file", "patch"))
         if tool_name in commands:
             command = tripwires._command_of(args)
-            moved = tripwires.command_cwd(command, known_cwd)
-            if moved and moved != known_cwd:
+            moved, unresolved = tripwires.command_cwd_change(command, known_cwd)
+            # Only Hermes' own terminal tool reports where it will run the next command.
+            is_terminal, reported = (
+                tripwires.terminal_result_cwd(result) if tool_name == "terminal" else (False, None)
+            )
+            if is_terminal and isinstance(args, dict) and args.get("workdir"):
+                # A per-call workdir is transient: Hermes runs the next command from the
+                # session directory it already had, whatever this one echoed or cd'd to.
+                moved, unresolved = known_cwd, None
+            elif reported is not None:
+                moved, unresolved = reported, None
+            elif is_terminal and unresolved is not None:
+                # Hermes reports a changed directory; none reported means it did not change.
+                moved, unresolved = known_cwd, None
+            if unresolved is not None:
+                # Somewhere this plugin cannot name. Remembering the old directory instead
+                # would point later scans and test credit at a repository the terminal left.
+                findings.append(
+                    {
+                        "category": "cwd",
+                        "severity": "info",
+                        "claim": "working directory for later commands is unknown",
+                        "evidence": unresolved,
+                        "unresolved": True,
+                    }
+                )
+            elif moved and moved != known_cwd:
                 # The terminal tool's cwd is not this process's cwd. Remember where it is so
                 # a later push or working-tree diff resolves against the right repository.
                 findings.append(
@@ -972,10 +997,28 @@ def _events(key_id: str) -> List[Dict[str, Any]]:
 
 
 def _last_cwd(key_id: str) -> Optional[str]:
-    """The directory the terminal tool was last seen in, if a command moved it."""
+    """The directory the terminal tool was last seen in, if a command moved it.
+
+    None after a ``cd`` this plugin could not resolve: that move is newer than any directory
+    seen before it.
+    """
     for event in reversed(_events(key_id)):
-        if event.get("category") == "cwd" and event.get("evidence"):
+        if event.get("category") != "cwd":
+            continue
+        if event.get("unresolved"):
+            return None
+        if event.get("evidence"):
             return str(event["evidence"])
+    return None
+
+
+def _unresolved_cwd(key_id: str) -> Optional[str]:
+    """The ``cd`` argument that left the terminal somewhere unknown, if that is the latest
+    move."""
+    for event in reversed(_events(key_id)):
+        if event.get("category") != "cwd":
+            continue
+        return str(event.get("evidence") or "") if event.get("unresolved") else None
     return None
 
 
@@ -1545,6 +1588,20 @@ def _pre_verify(
     if diff_base_gone is not None:
         diff_findings.append(diff_base_gone)
     diff_findings = _allowlisted(diff_findings, directory, led)
+    lost = _unresolved_cwd(key_id)
+    if lost is not None:
+        # Fail closed: a weakened test in that directory is invisible to every diff scan.
+        # Added after the allowlist, which would otherwise be read from whatever repository
+        # this process happens to sit in.
+        diff_findings.append(
+            tripwires._finding(
+                "guard_degraded",
+                "high",
+                "the working-tree scans cannot see the terminal's directory: a cd named a "
+                "path this plugin cannot resolve",
+                lost or "cd",
+            )
+        )
     if diff_findings:
         _log_check(
             "diff_scan",

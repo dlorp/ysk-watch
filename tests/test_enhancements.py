@@ -757,7 +757,9 @@ def test_tests_run_in_a_clean_clone_do_not_cover_edits_in_the_real_repo(ysk, rep
 
 
 def test_a_cd_that_may_never_run_does_not_move_the_directory(ysk):
-    assert ysk.tripwires.command_cwd("false && cd /tmp/clean; pytest", "/repo") == "/repo"
+    # Whether that cd ran depends on the command before it (``true && cd /x`` does run), so
+    # the run is credited to neither directory.
+    assert ysk.tripwires.command_cwd("false && cd /tmp/clean; pytest", "/repo") is None
     assert ysk.tripwires.command_cwd("cd /a && cd b && pytest", None) == "/a/b"
 
 
@@ -2356,3 +2358,167 @@ def test_a_pyc_outside_pycache_is_code(ysk, repo):
     (repo / "src" / "__pycache__").mkdir()
     (repo / "src" / "__pycache__" / "calc.cpython-311.pyc").write_bytes(b"\x00" * 16)
     assert ysk.evidence.tree_fingerprint(str(repo))["hash"] == after["hash"]
+
+
+def _terminal_at(ysk, command, output="", cwd=None, session="s1"):
+    payload = {"output": output, "exit_code": 0}
+    if cwd is not None:
+        payload["cwd"] = cwd
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": command},
+        result=json.dumps(payload),
+        status="ok",
+        session_id=session,
+    )
+
+
+def _credited_runs(ysk, session="s1"):
+    ids = ysk._ledger_ids(session, None)
+    return [
+        e for e in ysk._events(ids[0]) if e.get("category") == "test_run" and e.get("tree_root")
+    ]
+
+
+def test_a_cd_the_shell_alone_can_resolve_leaves_the_directory_unknown(ysk, monkeypatch):
+    monkeypatch.setenv("HOME", "/home/real")
+    change = ysk.tripwires.command_cwd_change
+    # HOME may have been exported in an earlier call, and quoting is gone after tokenizing.
+    assert change('cd "$HOME/x" && pytest', "/repo") == (None, "$HOME/x")
+    assert change("cd '$HOME'/x", "/repo") == (None, "$HOME/x")
+    assert change('cd "$CLONE" && pytest', "/repo") == (None, "$CLONE")
+    assert change('cd "$CLONE/.."', "/repo") == (None, "$CLONE/..")
+    assert change('cd "$(cat .d)/.."', "/repo")[0] is None
+    assert change("cd `cat .d`", "/repo")[0] is None
+    assert change("cd ~-/..", "/repo") == (None, "~-/..")
+    # ``~`` and a bare cd are the shell's HOME, known only from this command.
+    assert change("cd ~/x && pytest", "/repo") == (None, "~/x")
+    assert change("cd && pytest", "/repo") == (None, "~")
+    assert change("cd ~other/x", "/repo") == (None, "~other/x")
+    assert change("HOME=/h; cd ~/x", "/repo") == ("/h/x", None)
+    assert change("export HOME=/decoy && cd", "/repo") == ("/decoy", None)
+    assert change("cd -", "/repo") == (None, "-")
+    assert change("cd src", None) == (None, "src")
+    # Known again after an absolute cd; options and in-command assignments still resolve.
+    assert change('cd "$CLONE" && cd /abs', "/repo") == ("/abs", None)
+    assert change("cd -P /a && pytest", "/r") == ("/a", None)
+    assert change("cd -- /a", "/r") == ("/a", None)
+    assert change('D=/a; cd "$D"', None) == ("/a", None)
+
+
+def test_hermes_reported_cwd_resolves_a_variable_cd(ysk, repo, monkeypatch):
+    # The production false alarm: the plugin process sits in a repository, and the agent
+    # cds through $HOME again and again. Hermes reports where the terminal went the first
+    # time and reports nothing when a cd lands where it already was.
+    monkeypatch.chdir(repo)
+    for _ in range(3):
+        _terminal_at(ysk, f'cd "$HOME/{repo.name}" && git status', "clean", cwd=None)
+    _terminal_at(ysk, f'cd "$HOME/{repo.name}" && git status', "clean", cwd=str(repo))
+    _terminal_at(ysk, f'cd "$HOME/{repo.name}" && git log -1', "initial")
+    _terminal_at(ysk, f'cd "$HOME/{repo.name}" && git log -1', "initial")
+    assert ysk._on_pre_verify(session_id="s1", final_response="Checked the status.") is None
+
+
+def test_a_variable_cd_never_credits_a_run_to_the_old_repo(ysk, repo):
+    _terminal_at(ysk, f"cd {repo}", cwd=str(repo))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    _patch(ysk, str(repo / "src" / "calc.py"), "return a + b", "return a - b")
+    # While the terminal is known to be in the repo: neither run may fall back to it.
+    _terminal_at(ysk, "cd '$HOME'/proj && python -m pytest -q", "1 passed in 0.01s")
+    assert not _credited_runs(ysk)
+    _terminal_at(ysk, 'cd "$CLONE" && python -m pytest -q', "1 passed in 0.01s")
+    assert not _credited_runs(ysk)
+    # An exported HOME is followed, so the run lands in the decoy, not the repo.
+    _terminal_at(ysk, 'export HOME=/decoy; cd "$HOME/proj" && python -m pytest -q', "1 passed")
+    assert not _credited_runs(ysk)
+    assert ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+
+
+def test_an_unknown_directory_is_not_the_old_one_for_later_commands(ysk, repo):
+    _terminal_at(ysk, f"cd {repo}", cwd=str(repo))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    # No terminal JSON, so no Hermes report: the directory is unknown from here on.
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": 'cd "$CLONE"'},
+        result="moved",
+        status="ok",
+        session_id="s1",
+    )
+    _terminal_at(ysk, "python -m pytest -q", "1 passed in 0.01s")
+    assert not _credited_runs(ysk)
+    held = ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+    assert held and "guard_degraded" in held["message"]
+    assert "$CLONE" in held["message"]
+
+
+def test_a_directory_change_after_the_cd_chain_makes_the_directory_unknown(ysk):
+    change = ysk.tripwires.command_cwd_change
+    assert change("true && cd /decoy && pytest", "/repo") == (None, "cd /decoy")
+    assert change("ls; builtin cd /decoy && pytest", "/repo")[0] is None
+    assert change("ls && command cd /decoy", "/repo")[0] is None
+    assert change("pushd /decoy && pytest", "/repo")[0] is None
+    assert change("(cd /decoy && pytest)", "/repo")[0] is None
+    assert change("false || cd /decoy", "/repo")[0] is None
+    # Exports are followed like assignments, so the exported value is what cd sees.
+    assert change('export HOME=/decoy; cd "$HOME/proj" && pytest', "/repo") == (
+        "/decoy/proj",
+        None,
+    )
+    assert change("export A=1 B=2 && cd /x && pytest", "/repo") == ("/x", None)
+    # A chain that never moves later is unchanged.
+    assert change("cd /a && pytest -q && echo done", "/repo") == ("/a", None)
+
+
+def test_a_workdir_call_does_not_move_the_session_directory(ysk, repo, tmp_path):
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _terminal_at(ysk, f"cd {decoy}", cwd=str(decoy))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    _patch(ysk, str(repo / "src" / "calc.py"), "return a + b", "return a - b")
+    # Echoes the repo as cwd, but Hermes keeps the session in the decoy.
+    ysk._on_post_tool_call(
+        tool_name="terminal",
+        args={"command": f"cd {repo}", "workdir": str(tmp_path)},
+        result=json.dumps({"output": "", "exit_code": 0, "cwd": str(repo)}),
+        status="ok",
+        session_id="s1",
+    )
+    _terminal_at(ysk, "python -m pytest -q", "1 passed in 0.01s")
+    roots = {os.path.realpath(e["tree_root"]) for e in _credited_runs(ysk)}
+    assert roots == {os.path.realpath(decoy)}
+    assert ysk._on_pre_verify(session_id="s1", final_response="All tests pass.")
+
+
+def test_a_bare_cd_after_an_exported_home_is_not_credited(ysk, repo, monkeypatch):
+    # The plugin's own HOME holds the repo; the agent's shell HOME points elsewhere.
+    monkeypatch.setenv("HOME", str(repo.parent))
+    _terminal_at(ysk, f"cd {repo}", cwd=str(repo))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    _patch(ysk, str(repo / "src" / "calc.py"), "return a + b", "return a - b")
+    _terminal_at(ysk, "export HOME=/decoy")
+    _terminal_at(ysk, f"cd && cd {repo.name} && python -m pytest -q", "1 passed in 0.01s")
+    _terminal_at(ysk, f"cd ~/{repo.name} && python -m pytest -q", "1 passed in 0.01s")
+    assert not _credited_runs(ysk)
+
+
+def test_only_the_terminal_tool_is_trusted_to_report_its_directory(ysk, repo):
+    _terminal_at(ysk, f"cd {repo}", cwd=str(repo))
+    (repo / "src" / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    _patch(ysk, str(repo / "src" / "calc.py"), "return a + b", "return a - b")
+    for tool in ("shell", "bash"):
+        ysk._on_post_tool_call(
+            tool_name=tool,
+            args={"command": 'cd "$CLONE"'},
+            result=json.dumps({"output": "", "exit_code": 0}),
+            status="ok",
+            session_id="s1",
+        )
+        ysk._on_post_tool_call(
+            tool_name=tool,
+            args={"command": "python -m pytest -q"},
+            result=json.dumps({"output": "1 passed in 0.01s", "exit_code": 0}),
+            status="ok",
+            session_id="s1",
+        )
+    assert not _credited_runs(ysk)
