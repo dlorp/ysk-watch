@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-11-21
+
+### Fixed
+
+- `cd "$HOME/..."` no longer turns into a nested path that does not exist. Only variables
+  assigned in the same command were expanded, so the literal `$HOME/x` was joined onto the
+  last known directory, each later `cd "$HOME/x"` nested it again, and the test-weakening scan
+  reported it could not read the diff: a high `guard_degraded` hold on a clean tree. The
+  directory for later commands now comes from the `cwd` Hermes reports with a `terminal`
+  result (where it will run the next command); a `terminal` result without one means the
+  directory did not change, and a call with a per-call `workdir` never moves it, since Hermes
+  does not keep that directory for the next command. `cd -P`, `-L` and `--` take the path
+  after the option ([tripwires.py](./tripwires.py), [__init__.py](./__init__.py)).
+
+### Security
+
+- A `cd` whose target only the shell can resolve leaves the directory unknown instead of
+  guessing: an unassigned variable (including `$HOME`, which an earlier call can export, and
+  whose quoting is lost after tokenizing), a command substitution, `~`, `~user` and a bare `cd`
+  unless the command itself assigns HOME, `~-`, `~+`, `cd -`, and a relative `cd` from an
+  unknown start. A test run after such a `cd` is not credited; the old fallback to the previous
+  directory would have credited `cd "$CLONE" && pytest` to the repository the terminal left.
+  Without a Hermes report, later commands resolve nothing until an absolute `cd`, and
+  pre-verify holds with a `guard_degraded` finding that names the argument. That hold is added
+  after the allowlist, which would otherwise be read from the repository this process sits in.
+- A directory change after the leading `cd` chain (`true && cd /decoy && pytest`,
+  `builtin cd`, `command cd`, `pushd`, `(cd x && pytest)`) makes the directory unknown; it was
+  ignored, so the run was credited to where the terminal started. `export NAME=value` is
+  followed like an assignment, so `export HOME=/x; cd "$HOME/y"` lands in `/x/y`.
+- Only the `terminal` tool's report of its directory is trusted; `shell`, `bash` and
+  `execute_code` results are read from the command alone.
+
+### Changed
+
+- `cd ~/x && pytest` in one call is no longer credited, since the shell's HOME is not visible
+  here. `cd ~/x` in one call and `pytest` in the next still is: Hermes reports the directory
+  between calls.
+- `false && cd /tmp/clean; pytest` is credited to neither directory (it was credited to the
+  start), since whether the `cd` ran depends on the command before it.
+
 ## [0.8.2] - 2026-11-20
 
 ### Security

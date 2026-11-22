@@ -1852,20 +1852,79 @@ def _chunked_diff(
     return "".join(parts)
 
 
-def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
-    """The directory in effect at the end of a command, when it moved with ``cd``.
+_CD_OPTIONS = frozenset({"-L", "-P", "-e", "-@"})
 
-    Only a leading chain of ``cd`` (and assignments) joined by ``&&`` or ``;`` is followed.
-    After any other command the shell may never reach a later ``cd`` (``false && cd /x``),
-    so the directory stays at the last place it is known to have been.
+
+def _cd_target(raw: str, env: Dict[str, str], cwd: Optional[str]) -> Optional[str]:
+    """Where ``cd <raw>`` lands, or None when the command alone cannot say.
+
+    A variable the command did not assign, a command substitution, ``~-`` or ``~+`` has a
+    value only the shell knows. ``$HOME`` and ``~`` (a bare ``cd`` too) are no exception: the
+    agent can ``export HOME`` in an earlier call, and the quoting that decides whether
+    ``'$HOME'`` expands is gone once the command is tokenized. Both resolve only when this
+    command assigns HOME itself. A relative target from an unknown start is relative to nothing
+    visible here. Taking any of these literally builds a path that does not exist, and every
+    later relative ``cd`` nests inside it.
+    """
+    target = _expand(raw, env)
+    if "$" in target or "`" in target:
+        return None
+    if target == "~" or target.startswith("~/"):
+        # The shell's HOME, which only an assignment in this command makes visible here.
+        if "HOME" not in env:
+            return None
+        target = env["HOME"] + target[1:]
+    elif target.startswith("~"):
+        return None  # ``~user``, ``~+``, ``~-``
+    if os.path.isabs(target):
+        return target
+    if not cwd:
+        return None
+    # ``cd src`` is relative to where the shell already was.
+    return os.path.normpath(os.path.join(cwd, target))
+
+
+_DIR_CHANGERS = frozenset({"cd", "pushd", "popd"})
+_PREFIX_BUILTINS = frozenset({"builtin", "command"})
+
+
+def _moves_directory(tokens: List[str], env: Dict[str, str]) -> bool:
+    """True when a segment changes directory: ``cd``, ``pushd``, ``popd``, also behind
+    ``builtin``/``command`` or a subshell's ``(``."""
+    idx = 0
+    while idx < len(tokens) and _ASSIGN_RE.match(tokens[idx]):
+        idx += 1
+    while idx < len(tokens) and tokens[idx] in _PREFIX_BUILTINS:
+        idx += 1
+    if idx >= len(tokens):
+        return False
+    head = os.path.basename(_expand(tokens[idx], env)).lstrip("({")
+    return head in _DIR_CHANGERS
+
+
+def command_cwd_change(
+    command: str, start: Optional[str] = None
+) -> Tuple[Optional[str], Optional[str]]:
+    """The directory in effect at the end of a command's leading ``cd`` chain, and the
+    argument that made it unknown, if one did.
+
+    The chain is ``cd`` (and assignments, ``export NAME=value`` included) joined by ``&&`` or
+    ``;``. A ``cd`` this plugin cannot resolve (``cd "$CLONE"``, ``cd -``, ``cd src`` from an
+    unknown start) leaves the directory unknown, ``(None, argument)``, until a later ``cd``
+    names an absolute path. Any directory change after the chain ends (``true && cd /x``,
+    ``pushd``, ``(cd x && pytest)``) also makes it unknown: whatever runs after it runs
+    somewhere this plugin cannot place.
     """
     cwd = start
+    unresolved: Optional[str] = None
     env: Dict[str, str] = {}
-    for segment, op in _segments_with_ops(command):
+    segments = list(_segments_with_ops(command))
+    for index, (segment, op) in enumerate(segments):
         joiner = op.replace("\n", ";").strip()
-        if joiner and joiner != "&&" and set(joiner) != {";"}:
-            break
         tokens = _tokens(segment)
+        if joiner and joiner != "&&" and set(joiner) != {";"}:
+            rest = segments[index:]
+            break
         idx = 0
         while idx < len(tokens):
             assign = _ASSIGN_RE.match(tokens[idx])
@@ -1876,15 +1935,63 @@ def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
         if idx >= len(tokens):
             continue
         head = os.path.basename(_expand(tokens[idx], env))
+        if head == "export":
+            exported = tokens[idx + 1 :]
+            if all(_ASSIGN_RE.match(token) for token in exported):
+                for token in exported:
+                    assign = _ASSIGN_RE.match(token)
+                    env[assign.group("name")] = _expand(assign.group("value"), env)
+                continue
         if head != "cd":
+            rest = segments[index:]
             break
-        if idx + 1 < len(tokens):
-            target = os.path.expanduser(_expand(tokens[idx + 1], env))
-            # ``cd src`` is relative to where the shell already was, when that is known.
-            if cwd and not os.path.isabs(target):
-                target = os.path.normpath(os.path.join(cwd, target))
-            cwd = target
-    return cwd
+        args = tokens[idx + 1 :]
+        while args and args[0] in _CD_OPTIONS:
+            args = args[1:]
+        if args and args[0] == "--":
+            args = args[1:]
+        raw = args[0] if args else "~"  # a bare ``cd`` goes home
+        target = None if raw == "-" else _cd_target(raw, env, cwd)
+        cwd, unresolved = (target, None) if target is not None else (None, raw)
+    else:
+        rest = []
+    for segment, _op in rest:
+        if _moves_directory(_tokens(segment), env):
+            return None, segment.strip()
+    return cwd, unresolved
+
+
+def terminal_result_cwd(result: Any) -> Tuple[bool, Optional[str]]:
+    """``(is_terminal_result, cwd)`` from a terminal tool result.
+
+    Hermes runs every command from the directory it tracks and reports that directory as
+    ``cwd`` only when a command changed it (``pwd -P`` after the command). So for a terminal
+    result, a ``cwd`` is where the next command will run, and no ``cwd`` means the directory
+    did not change, however the command spelled its ``cd``. Not trusted for where this
+    command's own test run happened: that is read from the command.
+    """
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (ValueError, TypeError):
+            return False, None
+    if not isinstance(data, dict) or "exit_code" not in data:
+        return False, None
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and os.path.isabs(cwd):
+        return True, cwd
+    return True, None
+
+
+def command_cwd(command: str, start: Optional[str] = None) -> Optional[str]:
+    """The directory in effect at the end of a command: ``start`` when it did not move, None
+    when it is unknown (see ``command_cwd_change``).
+
+    Callers must not fall back to ``start`` on None: a run after ``cd "$CLONE"`` happened
+    somewhere else, and crediting it to ``start`` would let it cover edits it never saw.
+    """
+    return command_cwd_change(command, start)[0]
 
 
 def _scan_capped(what: str, count: int) -> Finding:
@@ -2317,7 +2424,7 @@ def _test_evidence(
         return []
     # Both the report path and the tree are read where the run happened: after the
     # command's own leading ``cd``, not where the terminal stood before it.
-    run_dir = (command_cwd(command, cwd) or cwd) if not is_code else cwd
+    run_dir = command_cwd(command, cwd) if not is_code else cwd
     results = evidence.parse_results(command, _output_of(result), run_dir, not_before=not_before)
     narrow = evidence.narrowing_flags(command)
     run_root = evidence.repo_root(run_dir) if run_dir else None
